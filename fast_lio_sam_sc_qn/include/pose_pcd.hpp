@@ -12,6 +12,7 @@ struct PosePcd
     double timestamp_;
     int idx_;
     bool processed_ = false;
+    bool is_degenerate_ = false; // set true when LIO covariance exceeds threshold
     PosePcd() {}
     PosePcd(const nav_msgs::Odometry &odom_in,
             const sensor_msgs::PointCloud2 &pcd_in,

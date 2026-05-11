@@ -1,0 +1,46 @@
+<launch>
+
+    <arg name="rviz"        default="true" />
+    <arg name="lidar"       default="mid360" />  <!-- mid360, ouster, hesai, velodyne, avia -->
+    <!-- Topic remapping: voxel_slam output → FAST-LIO-SAM-SC-QN input.
+         odom_pub_topic  publishes nav_msgs/Odometry in world frame per scan.
+         map_scan        publishes the current scan in world frame per scan
+                         (identical semantics to FAST-LIO's /cloud_registered). -->
+    <arg name="odom_topic"  default="/odom" />
+    <arg name="lidar_topic" default="/voxelslam/map_scan" />
+
+    <!-- ════════════════════════════════════════════════════════
+         1.  voxel_slam  (LIO frontend)
+         ════════════════════════════════════════════════════════ -->
+    <group ns="voxelslam">
+        <rosparam command="load"
+                  file="$(find voxel_slam)/config/$(arg lidar).yaml" />
+        <param name="finish" value="false" />
+        <!-- Override odom topic so it stays in /odom namespace -->
+        <param name="General/odom_pub_topic" value="/odom" />
+        <node pkg="voxel_slam" type="voxelslam" name="voxelslam"
+              output="screen">
+            <!-- Remap map_scan out of the ns so FAST-LIO-SAM-SC-QN can reach it -->
+            <remap from="map_scan" to="/voxelslam/map_scan" />
+        </node>
+    </group>
+
+    <!-- ════════════════════════════════════════════════════════
+         2.  FAST-LIO-SAM-SC-QN  (loop closure + pose graph backend)
+         ════════════════════════════════════════════════════════ -->
+    <rosparam command="load"
+              file="$(find fast_lio_sam_sc_qn)/config/config.yaml" />
+    <node pkg="fast_lio_sam_sc_qn" type="fast_lio_sam_sc_qn_node"
+          name="fast_lio_sam_sc_qn_node" output="screen">
+        <remap from="/Odometry"         to="$(arg odom_topic)" />
+        <remap from="/cloud_registered" to="$(arg lidar_topic)" />
+    </node>
+
+    <!-- ════════════════════════════════════════════════════════
+         3.  Visualisation
+         ════════════════════════════════════════════════════════ -->
+    <node if="$(arg rviz)" pkg="rviz" type="rviz" name="rviz_sam"
+          args="-d $(find fast_lio_sam_sc_qn)/config/sam_rviz.rviz"
+          launch-prefix="nice" />
+
+</launch>

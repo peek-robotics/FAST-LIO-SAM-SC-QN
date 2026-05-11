@@ -7,11 +7,9 @@ int main(int argc, char **argv)
 
     FastLioSamScQn fast_lio_sam_sc_qn_(nh_private);
 
-    ros::AsyncSpinner spinner(4); // Use multi threads
+    ros::AsyncSpinner spinner(4);
     spinner.start();
     ros::waitForShutdown();
-
-    fast_lio_sam_sc_qn_.~FastLioSamScQn(); // Explicit call of destructor
 
     return 0;
 }

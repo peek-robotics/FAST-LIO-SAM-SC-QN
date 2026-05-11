@@ -1,4 +1,5 @@
 #include "loop_closure.h"
+#include <ros/ros.h>
 
 LoopClosure::LoopClosure(const LoopClosureConfig &config)
 {
@@ -42,16 +43,29 @@ int LoopClosure::fetchCandidateKeyframeIdx(const PosePcd &query_keyframe,
     // from ScanContext, get the loop candidate
     std::pair<int, float> sc_detected_ = sc_manager_.detectLoopClosureIDGivenScan(query_keyframe.pcd_); // int: nearest node index,
                                                                                                         // float: relative yaw
+    const double sc_dist = sc_manager_.getLastSCDist();
     int candidate_keyframe_idx = sc_detected_.first;
-    if (candidate_keyframe_idx >= 0) // if exists
+    if (candidate_keyframe_idx < 0)
     {
-        // if close enough
-        if ((keyframes[candidate_keyframe_idx].pose_corrected_eig_.block<3, 1>(0, 3) - query_keyframe.pose_corrected_eig_.block<3, 1>(0, 3))
-                .norm() < config_.scancontext_max_correspondence_distance_)
-        {
-            return candidate_keyframe_idx;
-        }
+        ROS_DEBUG_THROTTLE(5.0, "[Loop] SC: no match for kf %d (best dist=%.3f >= threshold %.2f)",
+                           query_keyframe.idx_, sc_dist, sc_manager_.SC_DIST_THRES);
+        return -1;
     }
+    // candidate found — check spatial gate
+    const double spatial_dist =
+        (keyframes[candidate_keyframe_idx].pose_corrected_eig_.block<3, 1>(0, 3)
+         - query_keyframe.pose_corrected_eig_.block<3, 1>(0, 3)).norm();
+    if (spatial_dist < config_.scancontext_max_correspondence_distance_)
+    {
+        ROS_INFO("[Loop] SC match: kf %d → candidate kf %d  sc_dist=%.3f  spatial_dist=%.1fm",
+                 query_keyframe.idx_, candidate_keyframe_idx, sc_dist, spatial_dist);
+        return candidate_keyframe_idx;
+    }
+    ROS_INFO_THROTTLE(2.0,
+        "[Loop] SC match kf %d → candidate kf %d (sc_dist=%.3f) BLOCKED by spatial gate: "
+        "%.1fm > %.1fm",
+        query_keyframe.idx_, candidate_keyframe_idx, sc_dist,
+        spatial_dist, config_.scancontext_max_correspondence_distance_);
     return -1;
 }
 

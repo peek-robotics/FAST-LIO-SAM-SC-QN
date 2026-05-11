@@ -45,3 +45,9 @@ result:
   save_map_bag: true                         # Save result map in .bag format, NOTE: this is used for FAST-LIO-Localization-QN (https://github.com/engcang/FAST-LIO-Localization-QN)
   save_in_kitti_format: true                 # Save result in KITTI format
   seq_name: "sequence"                       # sequence name for saving scans and corresponding poses
+
+gps:
+  topic: "/odometry/filtered_map"            # nav_msgs/Odometry in map (ENU/UTM) frame, e.g. from robot_localization navsat_transform_node
+  cov_threshold: 25.0                        # [m^2] GPS factor added only when GPS noise_x AND noise_y < this value
+                                             # Also used as the LiDAR pose-covariance threshold: GPS only injected when SLAM uncertainty exceeds this
+  use_elevation: true                        # If false, ignores GPS z and uses current LiDAR z with noise_z=0.01 instead
