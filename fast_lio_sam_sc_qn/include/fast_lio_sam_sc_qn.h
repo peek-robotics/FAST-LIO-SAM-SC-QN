@@ -8,8 +8,10 @@
 #include <set>
 #include <vector>
 #include <memory>
+#include <atomic>
 #include <deque>
 #include <mutex>
+#include <thread>
 #include <string>
 #include <utility> // pair, make_pair
 #include <tuple>
@@ -29,6 +31,7 @@
 #include <std_msgs/String.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <sensor_msgs/Imu.h>
+#include <voxel_slam/LIODiag.h>
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
 #include <message_filters/subscriber.h>
@@ -68,6 +71,8 @@ private:
     double max_odom_jump_m_;       // drop frame if LIO delta > this (m)
     double lio_cov_threshold_;     // treat frame as degenerate if pos cov trace > this
     bool reinit_on_jump_;          // reset GTSAM on detected jump
+    int  reinit_skip_frames_ = 10;  // suppress keyframing for this many frames after re-anchor
+    int  post_reinit_frames_remaining_ = 0; // countdown: >0 → skip keyframe insertion
     ///// shared data - odom and pcd
     std::mutex realtime_pose_mutex_, keyframes_mutex_;
     std::mutex graph_mutex_, vis_mutex_;
@@ -79,6 +84,7 @@ private:
     ///// graph and values
     bool is_initialized_ = false;
     bool first_odom_received_ = false; // true after first real LIO frame; guards jump check bootstrap
+    std::atomic<uint8_t> latest_diag_state_{1}; // voxel_slam degrade_state (1=Ok); frames dropped when > 1
     bool loop_added_flag_ = false;     // for opt: true when any structural factor (loop or GPS) was added
     bool loop_added_flag_vis_ = false; // for vis
     bool loop_closure_added_this_cycle_ = false; // true only when a loop BetweenFactor was added this odom cycle
@@ -146,6 +152,7 @@ private:
     double gps_heading_cov_gate_;
     double gps_heading_noise_floor_;
     ros::Subscriber sub_gps_;
+    ros::Subscriber sub_lio_diag_;
     ///// Loop closure quality gates (orchard / repeating-feature resilience)
     int min_loop_keyframe_separation_; // minimum keyframe index gap between query and candidate
     double loop_noise_floor_rot_;      // [rad^2] minimum variance for loop closure rotation DOF
@@ -163,9 +170,14 @@ private:
     double ground_prior_sigma_ = 1.0;       // [m] 1σ tolerance; controls how hard the prior fights LIO Z drift
     gtsam::noiseModel::Base::shared_ptr ground_prior_noise_;  // precomputed from sigma
     bool gps_first_received_   = false;     // true after first message on the GPS position topic
+    double latest_gps_z_       = 0.0;        // [m] Z from most recent GPS fix; used for re-anchor
     double gps_initial_yaw_ = std::numeric_limits<double>::quiet_NaN(); // [rad] NaN = not yet set
     double gps_heading_init_timeout_;   // [s] fallback timeout (only used if wait_forever=false)
     ros::Time node_start_time_;
+    // Heading stability window — require yaw to be stable before accepting init
+    std::deque<double> heading_init_yaw_buf_;       // sliding window of recent yaw values [rad]
+    int    heading_init_stable_count_ = 5;          // required window size
+    double heading_init_stable_tol_   = 0.05;       // [rad] max angular range in window (~3°)
     // TF pose captured at heading-received time — used as the authoritative init translation
     // so the SLAM starts from the robot's current map position rather than the stale constructor-time seed.
     Eigen::Matrix4d tf_at_heading_pose_ = Eigen::Matrix4d::Identity();
@@ -179,7 +191,30 @@ private:
     // GPS visualization
     ros::Publisher gps_constraint_pub_;
     std::vector<pcl::PointXYZ>    gps_constraint_points_; // XY positions of accepted GPS factors
-    std::vector<Eigen::Vector2f>   gps_constraint_noises_; // actual (post-inflation) variance [m²] per factor (x, y)
+    std::vector<Eigen::Vector3f>   gps_constraint_noises_; // actual (post-inflation) variance [m²] per factor (x, y, z)
+    // ── Cloud sparsification ───────────────────────────────────────────────
+    bool               cloud_sparsify_en_   = false;
+    double             cloud_sparsify_res_  = 0.3;   // [m] voxel leaf size for old-keyframe clouds
+    int                cloud_sparsify_age_  = 30;    // keyframes behind frontier before eligible
+    std::thread        cloud_sparsify_thread_;
+    std::atomic<bool>  cloud_sparsify_stop_ {false};
+    // ── Performance monitoring ─────────────────────────────────────────────
+    bool           show_perf_stats_       = false;
+    ros::WallTimer perf_timer_;
+    ros::WallTime  perf_init_time_;
+    std::mutex     perf_mutex_;                        // protects the window accumulators below
+    double         perf_kf_time_sum_ms_   = 0.0;      // accumulated KF callback time [ms] since last report
+    double         perf_kf_time_max_ms_   = 0.0;      // peak KF callback time [ms] since last report
+    uint64_t       perf_kf_count_window_  = 0;        // KF count in current window
+    double         perf_loop_time_sum_ms_ = 0.0;      // accumulated loop timer time [ms] since last report
+    double         perf_loop_time_max_ms_ = 0.0;      // peak loop timer time [ms] since last report
+    uint64_t       perf_loop_count_window_= 0;        // loop attempts in current window
+    // lifetime counters — incremented from multiple threads, no explicit sync needed
+    std::atomic<uint64_t> perf_frames_total_{0};      // total LIO frames received
+    std::atomic<uint64_t> perf_frames_dropped_{0};    // frames dropped (degrade + jump)
+    std::atomic<uint64_t> perf_loops_accepted_{0};    // loop closures accepted
+    std::atomic<uint64_t> perf_loops_rejected_{0};    // loop closures rejected (score or yaw gate)
+    std::atomic<uint64_t> perf_gps_accepted_{0};      // GPS position factors added to graph
 
 public:
     explicit FastLioSamScQn(const ros::NodeHandle &n_private);
@@ -201,6 +236,9 @@ private:
     bool addGPSFactor(const double current_time, const int node_idx,
                       const double traveled_dist, const double current_z);
     void headingCallback(const sensor_msgs::ImuConstPtr &imu_msg);
+    void lioDiagCallback(const voxel_slam::LIODiagConstPtr &msg);
+    void perfTimerFunc(const ros::WallTimerEvent &event);
+    void cloudSparsifyThread();
 };
 
 

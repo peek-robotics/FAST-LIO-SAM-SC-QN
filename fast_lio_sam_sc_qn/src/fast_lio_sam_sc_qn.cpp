@@ -67,6 +67,7 @@ FastLioSamScQn::FastLioSamScQn(const ros::NodeHandle &n_private):
     nh_.param<double>("/gps/min_spacing", gps_min_spacing_, 5.0);
     nh_.param<double>("/gps/min_traveled_dist", gps_min_traveled_dist_, 5.0);
     nh_.param<int>("/gps/re_entry_skip_count", gps_re_entry_skip_count_, 2);
+    nh_.param<int>("/basic/reinit_skip_frames", reinit_skip_frames_, 10);
     nh_.param<double>("/gps/heading_cov_gate", gps_heading_cov_gate_, 0.1);
     nh_.param<double>("/gps/heading_noise_floor", gps_heading_noise_floor_, 0.01);
     nh_.param<double>("/gps/heading_factor_noise", heading_factor_noise_, 0.0076);
@@ -94,6 +95,8 @@ FastLioSamScQn::FastLioSamScQn(const ros::NodeHandle &n_private):
     std::string heading_topic;
     nh_.param<std::string>("/gps/heading_topic", heading_topic, "");
     nh_.param<double>("/gps/heading_init_timeout", gps_heading_init_timeout_, 30.0);
+    nh_.param<int>("/gps/heading_init_stable_count", heading_init_stable_count_, 5);
+    nh_.param<double>("/gps/heading_init_stable_tol", heading_init_stable_tol_, 0.05);
     gps_heading_wait_forever_ = !heading_topic.empty(); // if topic given, wait indefinitely
     node_start_time_ = ros::Time::now();
     /* Seed initial corrected pose from TF if available */
@@ -154,9 +157,9 @@ FastLioSamScQn::FastLioSamScQn(const ros::NodeHandle &n_private):
     std::string t_gps_constraints;
     nh_.param<std::string>("/topics/gps_constraints", t_gps_constraints, "/fast_lio_sam/gps_constraints");
     gps_constraint_pub_ = nh_.advertise<visualization_msgs::MarkerArray>(t_gps_constraints, 10, true);
-    ROS_INFO("[GPS] Constraint markers topic: %s  re_entry_skip_count=%d  cov_gate=%.1f  min_spacing=%.1f m",
-             gps_constraint_pub_.getTopic().c_str(), gps_re_entry_skip_count_,
-             gps_cov_gate_, gps_min_spacing_);
+    ROS_DEBUG("[GPS] Markers: %s  re_entry_skip=%d  cov_gate=%.1f  min_spacing=%.1f m",
+              gps_constraint_pub_.getTopic().c_str(), gps_re_entry_skip_count_,
+              gps_cov_gate_, gps_min_spacing_);
     debug_src_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("/src", 10, true);
     debug_dst_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("/dst", 10, true);
     debug_coarse_aligned_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("/coarse_aligned_quatro", 10, true);
@@ -177,10 +180,29 @@ FastLioSamScQn::FastLioSamScQn(const ros::NodeHandle &n_private):
         gps_heading_received_ = true;  // no heading topic configured: skip wait
         gps_initial_yaw_ = std::numeric_limits<double>::quiet_NaN(); // mark as not set
     }
+    sub_lio_diag_ = nh_.subscribe("/lidar_3d/voxel_slam/lio_diag", 10, &FastLioSamScQn::lioDiagCallback, this,
+                                   ros::TransportHints().tcpNoDelay());
     /* Timers */
     loop_timer_ = nh_.createTimer(ros::Duration(1 / loop_update_hz), &FastLioSamScQn::loopTimerFunc, this);
     vis_timer_ = nh_.createTimer(ros::Duration(1 / vis_hz), &FastLioSamScQn::visTimerFunc, this);
-    ROS_INFO("Main class, starting node...");
+    nh_.param<bool>("/basic/show_perf_stats", show_perf_stats_, false);
+    if (show_perf_stats_)
+    {
+        perf_init_time_ = ros::WallTime::now();
+        perf_timer_ = nh_.createWallTimer(ros::WallDuration(5.0), &FastLioSamScQn::perfTimerFunc, this);
+        ROS_INFO("[Perf] Performance stats enabled (5 s interval)");
+    }
+    nh_.param<bool>("/basic/cloud_sparsify", cloud_sparsify_en_, false);
+    if (cloud_sparsify_en_)
+    {
+        nh_.param<double>("/basic/cloud_sparsify_res", cloud_sparsify_res_, lc_config.voxel_res_);
+        nh_.param<int>("/basic/cloud_sparsify_age", cloud_sparsify_age_, 30);
+        cloud_sparsify_thread_ = std::thread(&FastLioSamScQn::cloudSparsifyThread, this);
+        ROS_INFO("[Init] Cloud sparsification enabled: res=%.2f m  age=%d kf",
+                 cloud_sparsify_res_, cloud_sparsify_age_);
+    }
+    ROS_INFO("[Init] Node starting — map: %s  robot: %s  loop: %.1f Hz  vis: %.1f Hz",
+             map_frame_.c_str(), robot_frame_.c_str(), loop_update_hz, vis_hz);
 }
 
 void FastLioSamScQn::odomPcdCallback(const nav_msgs::OdometryConstPtr &odom_msg,
@@ -189,8 +211,19 @@ void FastLioSamScQn::odomPcdCallback(const nav_msgs::OdometryConstPtr &odom_msg,
     Eigen::Matrix4d last_odom_tf;
     last_odom_tf = current_frame_.pose_eig_;                              // to calculate delta
     current_frame_ = PosePcd(*odom_msg, *pcd_msg, current_keyframe_idx_); // to be checked if keyframe or not
+    perf_frames_total_.fetch_add(1, std::memory_order_relaxed);
 
-    //// 0. LIO health checks — delta magnitude gate and covariance gate
+    //// 0a. voxel_slam degradation gate — drop frame if degrade_state > 1 (Low/Medium/High/Reset)
+    //       last_odom_tf is NOT updated so the first healthy frame after recovery triggers jump detection.
+    if (latest_diag_state_.load() > 1)
+    {
+        ROS_WARN_THROTTLE(1.0, "[LIO] Dropping frame: voxel_slam degrade_state=%u",
+                          static_cast<unsigned>(latest_diag_state_.load()));
+        perf_frames_dropped_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    //// 0b. LIO health checks — delta magnitude gate and covariance gate
     {
         // T1: inter-frame position jump check (catches LIO resets / degenerate frames)
         // Skip on the very first callback: last_odom_tf is Identity (default) while LIO may
@@ -202,15 +235,63 @@ void FastLioSamScQn::odomPcdCallback(const nav_msgs::OdometryConstPtr &odom_msg,
         {
             ROS_WARN_THROTTLE(1.0, "[LIO] Jump detected: %.2f m (threshold %.2f m) — dropping frame",
                               jump_dist, max_odom_jump_m_);
-            current_frame_.pose_eig_ = last_odom_tf; // freeze so next delta is clean
+            perf_frames_dropped_.fetch_add(1, std::memory_order_relaxed);
             if (reinit_on_jump_ && is_initialized_)
             {
-                ROS_WARN("[LIO] Resetting GTSAM backend after jump — will re-seed on next frame");
-                std::lock_guard<std::mutex> lock(realtime_pose_mutex_);
-                is_initialized_ = false;
-                odom_delta_ = Eigen::Matrix4d::Identity();
-                // last_corrected_pose_ is kept so the next init_from_tf lookup still has context
+                // Re-anchor the odom accumulator to the robot's current TF position.
+                // The existing GTSAM graph, keyframes, and corrected map are fully preserved.
+                // The post-reset LIO stream integrates from here as if nothing happened:
+                //   odom_delta_ = Identity  →  corrected_pose = last_corrected_pose_ * delta
+                // The first new keyframe will add a normal BetweenFactor from the last old
+                // keyframe — valid because the robot was stationary during the cascade and
+                // both poses are near the same map position.
+                //
+                // Do NOT freeze current_frame_.pose_eig_ to last_odom_tf. Freezing causes
+                // 300+ m deltas when voxel_slam resets its internal origin: every subsequent
+                // frame computes delta = (frozen stale value).inverse() * (new LIO origin),
+                // which triggers the jump check forever and prevents recovery.
+                {
+                    std::lock_guard<std::mutex> lock(realtime_pose_mutex_);
+                    odom_delta_ = Eigen::Matrix4d::Identity();
+                }
+                if (init_from_tf_)
+                {
+                    try
+                    {
+                        tf::StampedTransform tf_stamped;
+                        tf_listener_.lookupTransform(map_frame_, robot_frame_, ros::Time(0), tf_stamped);
+                        Eigen::Affine3d tf_eigen;
+                        tf::transformTFToEigen(tf_stamped, tf_eigen);
+                        Eigen::Matrix4d anchor = tf_eigen.matrix();
+                        // TF may be 2D-only (Z=0); use latest GPS Z when available.
+                        if (use_gps_elevation_ && gps_first_received_)
+                            anchor(2, 3) = latest_gps_z_;
+                        {
+                            std::lock_guard<std::mutex> lock(realtime_pose_mutex_);
+                            last_corrected_pose_ = anchor;
+                        }
+                        ROS_INFO("[LIO] Re-anchor from TF %s -> %s: t=(%.2f, %.2f, %.2f) — map preserved (%zu kf)",
+                                 map_frame_.c_str(), robot_frame_.c_str(),
+                                 anchor(0, 3), anchor(1, 3), anchor(2, 3), keyframes_.size());
+                    }
+                    catch (const tf::TransformException &ex)
+                    {
+                        ROS_WARN("[LIO] TF lookup failed for re-anchor (%s) — keeping last corrected pose", ex.what());
+                    }
+                }
+                // Trigger GPS re-entry LM on the next accepted fix so the graph is
+                // globally re-optimised after the odom gap.
+                gps_reentry_pending_ = true;
+                // Suppress keyframing until voxel_slam's post-reset frames have settled.
+                post_reinit_frames_remaining_ = reinit_skip_frames_;
             }
+            else if (!reinit_on_jump_)
+            {
+                // reinit_on_jump_ disabled: freeze so the next delta is bounded.
+                current_frame_.pose_eig_ = last_odom_tf;
+            }
+            // else: reinit_on_jump_ && !is_initialized_ — not yet initialised, do nothing
+            // (shouldn't happen in practice but is safe to ignore)
             return;
         }
 
@@ -251,7 +332,8 @@ void FastLioSamScQn::odomPcdCallback(const nav_msgs::OdometryConstPtr &odom_msg,
                                                             map_frame_,
                                                             robot_frame_));
     }
-    corrected_current_pcd_pub_.publish(pclToPclRos(transformPcd(current_frame_.pcd_, current_frame_.pose_corrected_eig_), map_frame_));
+    if (corrected_current_pcd_pub_.getNumSubscribers() > 0)
+        corrected_current_pcd_pub_.publish(pclToPclRos(transformPcd(current_frame_.pcd_, current_frame_.pose_corrected_eig_), map_frame_));
 
     if (!is_initialized_) //// init only once
     {
@@ -327,13 +409,18 @@ void FastLioSamScQn::odomPcdCallback(const nav_msgs::OdometryConstPtr &odom_msg,
         // ScanContext
         loop_closure_->updateScancontext(current_frame_.pcd_);
         is_initialized_ = true;
-        ROS_INFO("[Init] GTSAM graph initialised. Node ready.");
+        ROS_INFO("\033[1;32m[Init] GTSAM graph initialised. Node ready.\033[0m");
     }
     else
     {
         //// 2. check if keyframe
         high_resolution_clock::time_point t2 = high_resolution_clock::now();
-        if (!current_frame_.is_degenerate_ && checkIfKeyframe(current_frame_, keyframes_.back()))
+        if (post_reinit_frames_remaining_ > 0)
+        {
+            --post_reinit_frames_remaining_;
+            ROS_DEBUG_THROTTLE(1.0, "[LIO] Post-reinit warmup: %d frames remaining", post_reinit_frames_remaining_);
+        }
+        else if (!current_frame_.is_degenerate_ && checkIfKeyframe(current_frame_, keyframes_.back()))
         {
             // 2-2. if so, save
             {
@@ -469,9 +556,11 @@ void FastLioSamScQn::odomPcdCallback(const nav_msgs::OdometryConstPtr &odom_msg,
                         isam_handler_->update(gtsam::NonlinearFactorGraph(), gtsam::Values(),
                                               gtsam::FactorIndices(), boost::none, boost::none,
                                               boost::none, /*force_relinearize=*/true);
-                        ROS_INFO("[GPS] Forced full ISAM2 relinearization after GPS factor");
+                        ROS_DEBUG("[GPS] Forced ISAM2 relinearization");
                     }
 
+                    // PERF NOTE: committed_factors_ grows unboundedly (O(N_kf) factors).
+                    // LM rebuilds iterate the full history — monitor via perf stats / lm_max_factors gate.
                     committed_factors_.push_back(gtsam_graph_);
                     gtsam_graph_.resize(0);
                     init_esti_.clear();
@@ -555,7 +644,7 @@ void FastLioSamScQn::odomPcdCallback(const nav_msgs::OdometryConstPtr &odom_msg,
                                     try
                                     {
                                         isam_handler_->update(committed_factors_, lm_result);
-                                        ROS_INFO("[GPS] ISAM2 rebuilt from LM pass %d/%d successfully", pass + 1, lm_passes);
+                                        ROS_INFO("\033[1;32m[GPS] ISAM2 rebuilt from LM pass %d/%d successfully\033[0m", pass + 1, lm_passes);
                                     }
                                     catch (const gtsam::IndeterminantLinearSystemException &e3)
                                     {
@@ -634,7 +723,7 @@ void FastLioSamScQn::odomPcdCallback(const nav_msgs::OdometryConstPtr &odom_msg,
                                     try
                                     {
                                         isam_handler_->update(committed_factors_, lm_result);
-                                        ROS_INFO("[Loop] ISAM2 rebuilt from LM pass %d/%d successfully",
+                                        ROS_INFO("\033[1;32m[Loop] ISAM2 rebuilt from LM pass %d/%d successfully\033[0m",
                                                  pass + 1, loop_lm_passes_);
                                     }
                                     catch (const gtsam::IndeterminantLinearSystemException &e3)
@@ -650,8 +739,7 @@ void FastLioSamScQn::odomPcdCallback(const nav_msgs::OdometryConstPtr &odom_msg,
                 }
                 catch (const gtsam::IndeterminantLinearSystemException &e)
                 {
-                    ROS_WARN("[ISAM2] IndeterminantLinearSystem: %s", e.what());
-                    ROS_WARN("[ISAM2] Loop factors caused indeterminate system — discarding and rebuilding");
+                    ROS_WARN("[ISAM2] IndeterminantLinearSystem — discarding loop factor and rebuilding: %s", e.what());
 
                     // Remove the bad loop pair from tracking so the bucket can be retried later.
                     // Only do this if a loop closure (not just GPS) was added this cycle — loop_idx_pairs_
@@ -712,7 +800,7 @@ void FastLioSamScQn::odomPcdCallback(const nav_msgs::OdometryConstPtr &odom_msg,
                     {
                         isam_handler_->update(rebuild_graph, rebuild_values);
                         committed_factors_.push_back(safe_pending); // safe_pending is now committed
-                        ROS_INFO("[ISAM2] Rebuild from %zu committed factors succeeded",
+                        ROS_INFO("\033[1;32m[ISAM2] Rebuilt from %zu committed factors (loop discarded)\033[0m",
                                  committed_factors_.size());
                     }
                     catch (const gtsam::IndeterminantLinearSystemException &e2)
@@ -753,6 +841,8 @@ void FastLioSamScQn::odomPcdCallback(const nav_msgs::OdometryConstPtr &odom_msg,
             // correct poses in keyframes
             if (loop_added_flag_)
             {
+                // PERF NOTE: O(N_kf) pose update under keyframes_mutex_ — blocks keyframe insertion.
+                // For 5000 kf this is ~2–5 ms; grows linearly with session length.
                 std::lock_guard<std::mutex> lock(keyframes_mutex_);
                 for (size_t i = 0; i < corrected_esti_.size(); ++i)
                 {
@@ -762,13 +852,21 @@ void FastLioSamScQn::odomPcdCallback(const nav_msgs::OdometryConstPtr &odom_msg,
             }
             high_resolution_clock::time_point t6 = high_resolution_clock::now();
 
-            ROS_DEBUG("real: %.1f, key_add: %.1f, vis: %.1f, opt: %.1f, res: %.1f, tot: %.1fms",
+            ROS_DEBUG("[KF] real: %.1f  kf_add: %.1f  vis: %.1f  opt: %.1f  res: %.1f  tot: %.1f ms",
                      duration_cast<microseconds>(t2 - t1).count() / 1e3,
                      duration_cast<microseconds>(t3 - t2).count() / 1e3,
                      duration_cast<microseconds>(t4 - t3).count() / 1e3,
                      duration_cast<microseconds>(t5 - t4).count() / 1e3,
                      duration_cast<microseconds>(t6 - t5).count() / 1e3,
                      duration_cast<microseconds>(t6 - t1).count() / 1e3);
+            if (show_perf_stats_)
+            {
+                const double kf_ms = duration_cast<microseconds>(t6 - t1).count() / 1e3;
+                std::lock_guard<std::mutex> lk(perf_mutex_);
+                perf_kf_time_sum_ms_ += kf_ms;
+                perf_kf_time_max_ms_  = std::max(perf_kf_time_max_ms_, kf_ms);
+                ++perf_kf_count_window_;
+            }
         }
     }
     return;
@@ -798,8 +896,8 @@ void FastLioSamScQn::loopTimerFunc(const ros::TimerEvent &event)
     // a genuine revisit rather than an inter-row confusion.
     if (std::abs(latest_keyframe.idx_ - closest_keyframe_idx) < min_loop_keyframe_separation_)
     {
-        ROS_INFO_THROTTLE(5.0, "[Loop] Candidate kf %d too close to current kf %d (gap %d < %d) — skipping",
-                  closest_keyframe_idx, latest_keyframe.idx_,
+        ROS_DEBUG_THROTTLE(5.0, "[Loop] Candidate kf %d too close (gap %d < min %d) — skipping",
+                  closest_keyframe_idx,
                   std::abs(latest_keyframe.idx_ - closest_keyframe_idx),
                   min_loop_keyframe_separation_);
         return;
@@ -856,6 +954,15 @@ void FastLioSamScQn::loopTimerFunc(const ros::TimerEvent &event)
         {
             ROS_WARN("[Loop] Rejected: ICP yaw disagrees with LIO by %.1f° > %.1f° gate — likely false match",
                      yaw_diff_deg, loop_max_yaw_diff_deg_);
+            perf_loops_rejected_.fetch_add(1, std::memory_order_relaxed);
+            if (show_perf_stats_)
+            {
+                const double ms = duration_cast<microseconds>(high_resolution_clock::now() - t1).count() / 1e3;
+                std::lock_guard<std::mutex> lk(perf_mutex_);
+                perf_loop_time_sum_ms_ += ms;
+                perf_loop_time_max_ms_  = std::max(perf_loop_time_max_ms_, ms);
+                ++perf_loop_count_window_;
+            }
             return;
         }
 
@@ -879,19 +986,28 @@ void FastLioSamScQn::loopTimerFunc(const ros::TimerEvent &event)
         existing_loop_factors_.insert({src_bucket, dst_bucket});
         loop_added_flag_vis_ = true;
         loop_added_flag_ = true;
+        perf_loops_accepted_.fetch_add(1, std::memory_order_relaxed);
     }
     else
     {
-        ROS_WARN("Loop closure rejected. Score: %.3f", reg_output.score_);
+        ROS_WARN("[Loop] Rejected: score=%.3f (kf %d → %d)",
+                 reg_output.score_, latest_keyframe.idx_, closest_keyframe_idx);
+        perf_loops_rejected_.fetch_add(1, std::memory_order_relaxed);
     }
     high_resolution_clock::time_point t2 = high_resolution_clock::now();
 
-    debug_src_pub_.publish(pclToPclRos(loop_closure_->getSourceCloud(), map_frame_));
-    debug_dst_pub_.publish(pclToPclRos(loop_closure_->getTargetCloud(), map_frame_));
-    debug_fine_aligned_pub_.publish(pclToPclRos(loop_closure_->getFinalAlignedCloud(), map_frame_));
-    debug_coarse_aligned_pub_.publish(pclToPclRos(loop_closure_->getCoarseAlignedCloud(), map_frame_));
+    // PERF NOTE: 4 full cloud serializations every loop attempt regardless of subscribers.
+    // Gate by getNumSubscribers() to avoid unnecessary work.
+    if (debug_src_pub_.getNumSubscribers() > 0)
+        debug_src_pub_.publish(pclToPclRos(loop_closure_->getSourceCloud(), map_frame_));
+    if (debug_dst_pub_.getNumSubscribers() > 0)
+        debug_dst_pub_.publish(pclToPclRos(loop_closure_->getTargetCloud(), map_frame_));
+    if (debug_fine_aligned_pub_.getNumSubscribers() > 0)
+        debug_fine_aligned_pub_.publish(pclToPclRos(loop_closure_->getFinalAlignedCloud(), map_frame_));
+    if (debug_coarse_aligned_pub_.getNumSubscribers() > 0)
+        debug_coarse_aligned_pub_.publish(pclToPclRos(loop_closure_->getCoarseAlignedCloud(), map_frame_));
 
-    ROS_INFO("loop: %.1f", duration_cast<microseconds>(t2 - t1).count() / 1e3);
+    ROS_DEBUG("[Loop] Timer: %.1f ms", duration_cast<microseconds>(t2 - t1).count() / 1e3);
     return;
 }
 
@@ -911,6 +1027,7 @@ void FastLioSamScQn::visTimerFunc(const ros::TimerEvent &event)
         pcl::PointCloud<pcl::PointXYZ> corrected_odoms;
         nav_msgs::Path corrected_path;
         {
+            // PERF NOTE: O(N_kf) Values deep-copy while holding realtime_pose_mutex_ — delays TF/odom publish.
             std::lock_guard<std::mutex> lock(realtime_pose_mutex_);
             corrected_esti_copied = corrected_esti_;
         }
@@ -952,6 +1069,8 @@ void FastLioSamScQn::visTimerFunc(const ros::TimerEvent &event)
     //// 3. global map
     if (global_map_vis_switch_ && corrected_pcd_map_pub_.getNumSubscribers() > 0) // save time, only once
     {
+        // PERF NOTE: O(N_kf × pts/kf) transform + concat under keyframes_mutex_.
+        // For 1000 kf × 10k pts that is ~10 M point operations; gated by subscriber check above.
         pcl::PointCloud<PointType>::Ptr corrected_map(new pcl::PointCloud<PointType>());
         corrected_map->reserve(keyframes_[0].pcd_.size() * keyframes_.size()); // it's an approximated size
         {
@@ -970,7 +1089,7 @@ void FastLioSamScQn::visTimerFunc(const ros::TimerEvent &event)
         global_map_vis_switch_ = true;
     }
     high_resolution_clock::time_point tv2 = high_resolution_clock::now();
-    ROS_DEBUG("vis: %.1fms", duration_cast<microseconds>(tv2 - tv1).count() / 1e3);
+    ROS_DEBUG("[Vis] Timer: %.1f ms", duration_cast<microseconds>(tv2 - tv1).count() / 1e3);
     return;
 }
 
@@ -984,7 +1103,7 @@ void FastLioSamScQn::saveFlagCallback(const std_msgs::String::ConstPtr &msg)
     std::string scans_directory = seq_directory + "/scans";
     if (save_in_kitti_format_)
     {
-        ROS_INFO("\033[32;1mScans are saved in %s, following the KITTI and TUM format\033[0m", scans_directory.c_str());
+        ROS_INFO("\033[1;32m[Save] Scans → %s (KITTI/TUM format)\033[0m", scans_directory.c_str());
         if (fs::exists(seq_directory))
         {
             fs::remove_all(seq_directory);
@@ -1001,7 +1120,7 @@ void FastLioSamScQn::saveFlagCallback(const std_msgs::String::ConstPtr &msg)
                 // Save the point cloud
                 std::stringstream ss_;
                 ss_ << scans_directory << "/" << std::setw(6) << std::setfill('0') << i << ".pcd";
-                ROS_INFO("Saving %s...", ss_.str().c_str());
+                ROS_DEBUG("[Save] Writing %s", ss_.str().c_str());
                 pcl::io::savePCDFileASCII<PointType>(ss_.str(), keyframes_[i].pcd_);
 
                 // Save the pose in KITTI format
@@ -1024,7 +1143,7 @@ void FastLioSamScQn::saveFlagCallback(const std_msgs::String::ConstPtr &msg)
         }
         kitti_pose_file.close();
         tum_pose_file.close();
-        ROS_INFO("\033[32;1mScans and poses saved in .pcd and KITTI format\033[0m");
+        ROS_INFO("\033[1;32m[Save] Scans and poses saved (PCD + KITTI)\033[0m");
     }
 
     if (save_map_bag_)
@@ -1042,7 +1161,7 @@ void FastLioSamScQn::saveFlagCallback(const std_msgs::String::ConstPtr &msg)
             }
         }
         bag.close();
-        ROS_INFO("\033[36;1mResult saved in .bag format!!!\033[0m");
+        ROS_INFO("\033[1;36m[Save] Result saved in .bag format\033[0m");
     }
 
     if (save_map_pcd_)
@@ -1058,12 +1177,18 @@ void FastLioSamScQn::saveFlagCallback(const std_msgs::String::ConstPtr &msg)
         }
         const auto &voxelized_map = voxelizePcd(corrected_map, voxel_res_);
         pcl::io::savePCDFileASCII<PointType>(seq_directory + "/" + seq_name_ + "_map.pcd", *voxelized_map);
-        ROS_INFO("\033[32;1mAccumulated map cloud saved in .pcd format\033[0m");
+        ROS_INFO("\033[1;32m[Save] Accumulated map saved in .pcd format\033[0m");
     }
 }
 
 FastLioSamScQn::~FastLioSamScQn()
 {
+    // Stop background thread before touching keyframes_
+    if (cloud_sparsify_en_)
+    {
+        cloud_sparsify_stop_.store(true);
+        cloud_sparsify_thread_.join();
+    }
     // save map
     if (save_map_bag_)
     {
@@ -1080,7 +1205,7 @@ FastLioSamScQn::~FastLioSamScQn()
             }
         }
         bag.close();
-        ROS_INFO("\033[36;1mResult saved in .bag format!!!\033[0m");
+        ROS_INFO("\033[1;36m[Save] Result saved in .bag format\033[0m");
     }
     if (save_map_pcd_)
     {
@@ -1095,7 +1220,7 @@ FastLioSamScQn::~FastLioSamScQn()
         }
         const auto &voxelized_map = voxelizePcd(corrected_map, voxel_res_);
         pcl::io::savePCDFileASCII<PointType>(package_path_ + "/result.pcd", *voxelized_map);
-        ROS_INFO("\033[32;1mResult saved in .pcd format!!!\033[0m");
+        ROS_INFO("\033[1;32m[Save] Result saved in .pcd format\033[0m");
     }
 }
 
@@ -1121,32 +1246,65 @@ void FastLioSamScQn::headingCallback(const sensor_msgs::ImuConstPtr &imu_msg)
         }
         else
         {
-            gps_initial_yaw_      = yaw;
-            gps_heading_received_ = true;
-            ROS_INFO("\033[1;32m[GPS Heading] Received initial yaw=%.1f° — SLAM init unblocked.\033[0m",
-                     yaw * 180.0 / M_PI);
-            // Re-read TF right now so the SLAM starts from the robot's *current* map position
-            // rather than the (potentially stale or unavailable) constructor-time TF seed.
-            if (init_from_tf_)
+            // Accumulate a stability window: only accept the heading once it has been
+            // consistent for heading_init_stable_count_ consecutive messages, guarding
+            // against capturing a yaw that is changing mid-turn.
+            heading_init_yaw_buf_.push_back(yaw);
+            while ((int)heading_init_yaw_buf_.size() > heading_init_stable_count_)
+                heading_init_yaw_buf_.pop_front();
+
+            if ((int)heading_init_yaw_buf_.size() < heading_init_stable_count_)
             {
-                try
-                {
-                    tf::StampedTransform tf_stamped;
-                    tf_listener_.lookupTransform(map_frame_, robot_frame_, ros::Time(0), tf_stamped);
-                    Eigen::Affine3d tf_eigen;
-                    tf::transformTFToEigen(tf_stamped, tf_eigen);
-                    tf_at_heading_pose_ = tf_eigen.matrix();
-                    tf_at_heading_valid_ = true;
-                    ROS_INFO("[Init] TF at heading time %s -> %s: t=(%.2f, %.2f, %.2f)",
-                             map_frame_.c_str(), robot_frame_.c_str(),
-                             tf_stamped.getOrigin().x(), tf_stamped.getOrigin().y(), tf_stamped.getOrigin().z());
-                }
-                catch (const tf::TransformException &ex)
-                {
-                    ROS_WARN("[Init] TF lookup failed at heading time (%s) — using accumulated LIO position", ex.what());
-                }
+                ROS_INFO_THROTTLE(2.0, "[GPS Heading] Collecting stability window (%d / %d samples)...",
+                                  (int)heading_init_yaw_buf_.size(), heading_init_stable_count_);
             }
-        } // else: gps_first_received_
+            else
+            {
+                // Compute circular range relative to the first sample in the window.
+                const double ref = heading_init_yaw_buf_.front();
+                double min_d = 0.0, max_d = 0.0;
+                for (const double y : heading_init_yaw_buf_)
+                {
+                    const double d = std::remainder(y - ref, 2.0 * M_PI);
+                    min_d = std::min(min_d, d);
+                    max_d = std::max(max_d, d);
+                }
+                const double range = max_d - min_d;
+                if (range >= heading_init_stable_tol_)
+                {
+                    ROS_INFO_THROTTLE(2.0, "[GPS Heading] Waiting for stable yaw (range=%.2f° >= tol=%.2f°) — robot may be turning...",
+                                      range * 180.0 / M_PI, heading_init_stable_tol_ * 180.0 / M_PI);
+                }
+                else
+                {
+                    gps_initial_yaw_      = heading_init_yaw_buf_.back();
+                    gps_heading_received_ = true;
+                    ROS_INFO("\033[1;32m[GPS Heading] Received initial yaw=%.1f° (stable: range=%.2f° over %d samples) — SLAM init unblocked.\033[0m",
+                             gps_initial_yaw_ * 180.0 / M_PI, range * 180.0 / M_PI, heading_init_stable_count_);
+                    // Snapshot TF now so init uses the robot's current map position,
+                    // not the potentially stale constructor-time seed.
+                    if (init_from_tf_)
+                    {
+                        try
+                        {
+                            tf::StampedTransform tf_stamped;
+                            tf_listener_.lookupTransform(map_frame_, robot_frame_, ros::Time(0), tf_stamped);
+                            Eigen::Affine3d tf_eigen;
+                            tf::transformTFToEigen(tf_stamped, tf_eigen);
+                            tf_at_heading_pose_ = tf_eigen.matrix();
+                            tf_at_heading_valid_ = true;
+                            ROS_INFO("[Init] TF at heading time %s -> %s: t=(%.2f, %.2f, %.2f)",
+                                     map_frame_.c_str(), robot_frame_.c_str(),
+                                     tf_stamped.getOrigin().x(), tf_stamped.getOrigin().y(), tf_stamped.getOrigin().z());
+                        }
+                        catch (const tf::TransformException &ex)
+                        {
+                            ROS_WARN("[Init] TF lookup failed at heading time (%s) — using accumulated LIO position", ex.what());
+                        }
+                    }
+                } // stable
+            } // full window
+        } // gps_first_received_
     } // if (!gps_heading_received_)
 
     // Always cache the latest yaw so odomPcdCallback can add continuous heading PriorFactors.
@@ -1165,7 +1323,13 @@ void FastLioSamScQn::gpsCallback(const nav_msgs::OdometryConstPtr &gps_msg)
 {
     std::lock_guard<std::mutex> lock(gps_mutex_);
     gps_first_received_ = true;
+    latest_gps_z_ = gps_msg->pose.pose.position.z;
     gps_queue_.push_back(*gps_msg);
+}
+
+void FastLioSamScQn::lioDiagCallback(const voxel_slam::LIODiagConstPtr &msg)
+{
+    latest_diag_state_.store(msg->degrade_state);
 }
 
 bool FastLioSamScQn::addGPSFactor(const double current_time, const int node_idx,
@@ -1323,11 +1487,12 @@ bool FastLioSamScQn::addGPSFactor(const double current_time, const int node_idx,
                                           gtsam::Point3(gps_x, gps_y, gps_z),
                                           gps_noise));
         gps_constraint_points_.push_back(pcl::PointXYZ(gps_x, gps_y, gps_z));
-        gps_constraint_noises_.push_back(Eigen::Vector2f(static_cast<float>(gps_noise_vec[0]),
-                                                          static_cast<float>(gps_noise_vec[1])));
+        gps_constraint_noises_.push_back(Eigen::Vector3f(static_cast<float>(gps_noise_vec[0]),
+                                                          static_cast<float>(gps_noise_vec[1]),
+                                                          static_cast<float>(gps_noise_vec[2])));
         // Publish immediately so RViz subscribers see the marker without waiting for the vis timer.
         gps_constraint_pub_.publish(getGpsMarkers());
-        ROS_INFO("\033[1;36m[GPS] Position factor at node %d (%.2f, %.2f, %.2f) noise_raw(%.3f,%.3f) noise_actual(%.3f,%.3f,%.3f)\033[0m",
+        ROS_INFO("\033[1;36m[GPS] Factor @node %d  pos=(%.1f, %.1f, %.1f)  σ_raw=(%.3f, %.3f)  σ_eff=(%.3f, %.3f, %.3f)\033[0m",
                  node_idx, gps_x, gps_y, gps_z, noise_x, noise_y,
                  static_cast<float>(gps_noise_vec[0]), static_cast<float>(gps_noise_vec[1]), static_cast<float>(gps_noise_vec[2]));
 
@@ -1354,6 +1519,7 @@ bool FastLioSamScQn::addGPSFactor(const double current_time, const int node_idx,
                      node_idx, gps_yaw * 180.0 / M_PI, heading_cov);
         }
 
+        perf_gps_accepted_.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
     return false;
@@ -1414,13 +1580,14 @@ visualization_msgs::MarkerArray FastLioSamScQn::getGpsMarkers()
     for (size_t i = 0; i < gps_constraint_points_.size(); ++i)
     {
         const auto &pt = gps_constraint_points_[i];
-        // sigma_xy is the average of x and y 1σ values; used as the sphere radius.
-        float sigma = 0.5f;
+        // Axis-aligned ellipsoid: each diameter = 2σ for that axis.
+        // Encodes the actual XYZ uncertainty reported by robot_localization / RTK GPS.
+        float sx = 0.5f, sy = 0.5f, sz = 0.5f;
         if (i < gps_constraint_noises_.size())
         {
-            const float sx = std::sqrt(std::max(gps_constraint_noises_[i].x(), 0.0f));
-            const float sy = std::sqrt(std::max(gps_constraint_noises_[i].y(), 0.0f));
-            sigma = std::max(0.1f, 0.5f * (sx + sy));  // average 1σ, min 0.1 m
+            sx = std::max(0.1f, std::sqrt(std::max(gps_constraint_noises_[i].x(), 0.0f)));
+            sy = std::max(0.1f, std::sqrt(std::max(gps_constraint_noises_[i].y(), 0.0f)));
+            sz = std::max(0.1f, std::sqrt(std::max(gps_constraint_noises_[i].z(), 0.0f)));
         }
         visualization_msgs::Marker node;
         node.header.frame_id = map_frame_;
@@ -1432,7 +1599,9 @@ visualization_msgs::MarkerArray FastLioSamScQn::getGpsMarkers()
         node.pose.position.x = pt.x;
         node.pose.position.y = pt.y;
         node.pose.position.z = pt.z;
-        node.scale.x = node.scale.y = node.scale.z = 2.0f * sigma;  // diameter = 2σ
+        node.scale.x = 2.0f * sx;  // diameter = 2σ per axis
+        node.scale.y = 2.0f * sy;
+        node.scale.z = 2.0f * sz;
         node.color.r = 0.0f; node.color.g = 1.0f; node.color.b = 0.4f; node.color.a = 0.5f;
         ma.markers.push_back(node);
     }
@@ -1464,4 +1633,131 @@ visualization_msgs::MarkerArray FastLioSamScQn::getGpsMarkers()
 bool FastLioSamScQn::checkIfKeyframe(const PosePcd &pose_pcd_in, const PosePcd &latest_pose_pcd)
 {
     return keyframe_thr_ < (latest_pose_pcd.pose_corrected_eig_.block<3, 1>(0, 3) - pose_pcd_in.pose_corrected_eig_.block<3, 1>(0, 3)).norm();
+}
+
+void FastLioSamScQn::cloudSparsifyThread()
+{
+    while (!cloud_sparsify_stop_.load(std::memory_order_relaxed))
+    {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+
+        int boundary;
+        {
+            std::lock_guard<std::mutex> lk(keyframes_mutex_);
+            boundary = static_cast<int>(keyframes_.size()) - cloud_sparsify_age_;
+        }
+        if (boundary <= 0) continue;
+
+        for (int i = 0; i < boundary; ++i)
+        {
+            if (cloud_sparsify_stop_.load(std::memory_order_relaxed)) break;
+
+            // Copy cloud out under lock, then filter without holding it
+            pcl::PointCloud<PointType> cloud_copy;
+            {
+                std::lock_guard<std::mutex> lk(keyframes_mutex_);
+                if (i >= static_cast<int>(keyframes_.size())) break;
+                if (keyframes_[i].cloud_sparsified_) continue;
+                cloud_copy = keyframes_[i].pcd_;
+            }
+            if (cloud_copy.empty()) continue;
+
+            pcl::VoxelGrid<PointType> vf;
+            const float leaf = static_cast<float>(cloud_sparsify_res_);
+            vf.setInputCloud(cloud_copy.makeShared());
+            vf.setLeafSize(leaf, leaf, leaf);
+            pcl::PointCloud<PointType> filtered;
+            vf.filter(filtered);
+
+            {
+                std::lock_guard<std::mutex> lk(keyframes_mutex_);
+                if (i < static_cast<int>(keyframes_.size()) && !keyframes_[i].cloud_sparsified_)
+                {
+                    keyframes_[i].pcd_ = std::move(filtered);
+                    keyframes_[i].cloud_sparsified_ = true;
+                }
+            }
+
+            // Yield between keyframes — this is a low-priority background task
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+}
+
+void FastLioSamScQn::perfTimerFunc(const ros::WallTimerEvent &)
+{
+    const double uptime_s = (ros::WallTime::now() - perf_init_time_).toSec();
+
+    // ── Swap-and-reset timing window accumulators ───────────────────────────
+    double   kf_avg_ms = 0.0,   kf_max_ms = 0.0;
+    uint64_t kf_window = 0;
+    double   loop_avg_ms = 0.0, loop_max_ms = 0.0;
+    uint64_t loop_window = 0;
+    {
+        std::lock_guard<std::mutex> lk(perf_mutex_);
+        kf_window  = perf_kf_count_window_;
+        kf_max_ms  = perf_kf_time_max_ms_;
+        kf_avg_ms  = kf_window > 0 ? perf_kf_time_sum_ms_ / kf_window : 0.0;
+        perf_kf_time_sum_ms_ = perf_kf_time_max_ms_ = 0.0;
+        perf_kf_count_window_ = 0;
+
+        loop_window  = perf_loop_count_window_;
+        loop_max_ms  = perf_loop_time_max_ms_;
+        loop_avg_ms  = loop_window > 0 ? perf_loop_time_sum_ms_ / loop_window : 0.0;
+        perf_loop_time_sum_ms_ = perf_loop_time_max_ms_ = 0.0;
+        perf_loop_count_window_ = 0;
+    }
+
+    // ── Lifetime counters ──────────────────────────────────────────────────
+    const uint64_t frames      = perf_frames_total_.load(std::memory_order_relaxed);
+    const uint64_t dropped     = perf_frames_dropped_.load(std::memory_order_relaxed);
+    const uint64_t loops_acc   = perf_loops_accepted_.load(std::memory_order_relaxed);
+    const uint64_t loops_rej   = perf_loops_rejected_.load(std::memory_order_relaxed);
+    const uint64_t gps_acc     = perf_gps_accepted_.load(std::memory_order_relaxed);
+    const size_t   kf_total    = static_cast<size_t>(current_keyframe_idx_);
+    const size_t   n_committed = committed_factors_.size();
+
+    // ── Memory: keyframe cloud storage estimate ────────────────────────────
+    // pcl::PointXYZI = 16 bytes/point; this is raw point data only (no PCL header overhead)
+    size_t kf_pts_total = 0;
+    {
+        std::lock_guard<std::mutex> lk(keyframes_mutex_);
+        for (const auto &kf : keyframes_)
+            kf_pts_total += kf.pcd_.size();
+    }
+    const double kf_cloud_mb = kf_pts_total * sizeof(PointType) / 1.0e6;
+
+    // ── Memory: process RSS from /proc/self/status ─────────────────────────
+    size_t rss_mb = 0;
+    {
+        std::ifstream proc_status("/proc/self/status");
+        std::string line;
+        while (std::getline(proc_status, line))
+        {
+            if (line.compare(0, 6, "VmRSS:") == 0)
+            {
+                size_t kb = 0;
+                std::sscanf(line.c_str(), "VmRSS: %zu kB", &kb);
+                rss_mb = kb / 1024;
+                break;
+            }
+        }
+    }
+
+    // ── Report (single line, bold prefix) ─────────────────────────────────
+    ROS_INFO(
+        "\033[1;95m[Perf +%.0fs]\033[0m"
+        "  frames %lu (drop %lu / %.0f%%)"
+        "  KF %zu (%.2f/s)  kf_cb avg %.1f max %.1f ms"
+        "  loop %lu/%lu acc  loop_cb avg %.1f max %.1f ms"
+        "  GPS %lu factors  graph %zu factors"
+        "  cloud %.0f MB  RSS %zu MB",
+        uptime_s,
+        frames, dropped, frames > 0 ? 100.0 * dropped / frames : 0.0,
+        kf_total, uptime_s > 0.0 ? static_cast<double>(kf_total) / uptime_s : 0.0,
+        kf_avg_ms, kf_max_ms,
+        loops_acc, loops_acc + loops_rej,
+        loop_avg_ms, loop_max_ms,
+        gps_acc, n_committed,
+        kf_cloud_mb, rss_mb);
 }
