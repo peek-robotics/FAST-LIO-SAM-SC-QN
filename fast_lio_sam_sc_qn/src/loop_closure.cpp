@@ -1,11 +1,16 @@
 #include "loop_closure.h"
 #include <ros/ros.h>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
 
 LoopClosure::LoopClosure(const LoopClosureConfig &config)
 {
     config_ = config;
     const auto &gc = config_.gicp_config_;
     const auto &qc = config_.quatro_config_;
+    sc_manager_.setSCdistThres(config_.scancontext_dist_thres_);
+    sc_manager_.setMaximumRadius(config_.scancontext_max_radius_);
     ////// nano_gicp init
     nano_gicp_.setNumThreads(gc.nano_thread_number_);
     nano_gicp_.setCorrespondenceRandomness(gc.nano_correspondences_number_);
@@ -35,6 +40,48 @@ LoopClosure::~LoopClosure() {}
 void LoopClosure::updateScancontext(pcl::PointCloud<PointType> cloud)
 {
     sc_manager_.makeAndSaveScancontextAndKeys(cloud);
+}
+
+void LoopClosure::saveDescriptors(const std::string& out_dir) const
+{
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(out_dir, ec);
+    if (ec)
+    {
+        ROS_ERROR("[Save] Cannot create SC dir %s: %s", out_dir.c_str(), ec.message().c_str());
+        return;
+    }
+
+    const auto& descs = sc_manager_.polarcontexts_;
+    if (descs.empty())
+    {
+        ROS_WARN("[Save] No SC descriptors to save");
+        return;
+    }
+
+    const std::string path = out_dir + "/sc_descriptors.bin";
+    std::ofstream ofs(path, std::ios::binary);
+    if (!ofs)
+    {
+        ROS_ERROR("[Save] Cannot open %s for writing", path.c_str());
+        return;
+    }
+
+    // [uint32 count] then per-descriptor [uint32 rows][uint32 cols][rows*cols float64, column-major]
+    const uint32_t count = static_cast<uint32_t>(descs.size());
+    ofs.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    for (const auto& m : descs)
+    {
+        const uint32_t rows = static_cast<uint32_t>(m.rows());
+        const uint32_t cols = static_cast<uint32_t>(m.cols());
+        ofs.write(reinterpret_cast<const char*>(&rows), sizeof(rows));
+        ofs.write(reinterpret_cast<const char*>(&cols), sizeof(cols));
+        // Eigen matrices are column-major; write data() directly
+        ofs.write(reinterpret_cast<const char*>(m.data()), sizeof(double) * rows * cols);
+    }
+    ROS_INFO("\033[1;32m[Save] SC descriptors \u2192 %s  (%u descriptors)\033[0m",
+             path.c_str(), count);
 }
 
 int LoopClosure::fetchCandidateKeyframeIdx(const PosePcd &query_keyframe,

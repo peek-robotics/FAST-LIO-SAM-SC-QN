@@ -58,6 +58,8 @@ struct LoopClosureConfig
     bool enable_submap_matching_ = true;
     int num_submap_keyframes_ = 10;
     double voxel_res_ = 0.1;
+    double scancontext_dist_thres_ = 0.2;
+    double scancontext_max_radius_ = 80.0;
     double scancontext_max_correspondence_distance_;
     NanoGICPConfig gicp_config_;
     QuatroConfig quatro_config_;
@@ -109,6 +111,10 @@ public:
     pcl::PointCloud<PointType> getCoarseAlignedCloud();
     pcl::PointCloud<PointType> getFinalAlignedCloud();
     int getClosestKeyframeidx();
+
+    /// Save all ScanContext descriptors to out_dir/sc_descriptors.bin for offline PGO.
+    /// Format: [uint32 count] then per-descriptor [uint32 rows][uint32 cols][data: rows*cols float64, column-major].
+    void saveDescriptors(const std::string& out_dir) const;
 };
 
 #endif

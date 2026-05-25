@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -28,12 +29,21 @@ struct BackendParams
 {
     // LM batch refinement
     int    max_lm_factors    = 500;    ///< skip batch LM when committed graph exceeds this
-    int    lm_max_iterations = 20;     ///< max LM iterations per solve
+    int    lm_max_iterations = 200;    ///< max LM iterations per solve
+    double lm_rel_tol        = 1e-5;   ///< LM relative error change threshold to stop
+    double lm_abs_tol        = 1e-5;   ///< LM absolute error change threshold to stop
     int    lm_max_passes     = 3;      ///< max adaptive LM passes on GPS re-entry
     double lm_max_distance   = 50.0;   ///< [m] dist gap that maps to lm_max_passes_
 
     // LM after loop closure
     int loop_lm_passes       = 1;      ///< LM passes after each accepted loop closure
+
+    // Per-axis odom BetweenFactor variances — [roll², pitch², yaw²] rad² and [x², y², z²] m².
+    // Inflate z and yaw to let GPS/heading override LIO drift on those axes.
+    std::array<double,3> odom_noise_rot       = {1e-4, 1e-4, 1e-4};  ///< normal mode rotation
+    std::array<double,3> odom_noise_pos       = {1e-2, 1e-2, 1e-2};  ///< normal mode position
+    std::array<double,3> odom_noise_rot_degen = {1e-2, 1e-2, 1e-2};  ///< degenerate mode rotation
+    std::array<double,3> odom_noise_pos_degen = {1e-1, 1e-1, 1e-1};  ///< degenerate mode position
 
     // Loop closure quality gates
     int    min_loop_kf_sep       = 50;    ///< minimum keyframe-index gap between loop endpoints

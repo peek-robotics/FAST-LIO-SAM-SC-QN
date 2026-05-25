@@ -53,15 +53,14 @@ GpsParams FastLioSamScQn::loadGpsParams(const ros::NodeHandle& nh)
                  sbas.cov_gate, sbas.noise_floor, sbas.cov_scale);
     }
 
-    nh.param<bool>("/gps/use_slam_cov_gate",    p.use_slam_cov_gate,   false);
-    nh.param<double>("/gps/cov_threshold",       p.slam_cov_threshold,  25.0);
     nh.param<bool>("/gps/use_elevation",         p.use_elevation,       true);
     nh.param<double>("/gps/min_spacing",         p.min_spacing,         5.0);
     nh.param<double>("/gps/min_traveled_dist",   p.min_traveled_dist,   5.0);
     nh.param<int>("/gps/re_entry_skip_count",    p.re_entry_skip_count, 2);
-    nh.param<double>("/gps/heading_cov_gate",    p.heading_cov_gate,    0.1);
-    nh.param<double>("/gps/heading_noise_floor", p.heading_noise_floor, 0.01);
-    nh.param<double>("/gps/heading_factor_noise",p.heading_factor_noise,0.0076);
+    nh.param<double>("/gps/heading_cov_gate",      p.heading_cov_gate,      0.1);
+    nh.param<double>("/gps/heading_noise_floor",    p.heading_noise_floor,   0.01);
+    nh.param<double>("/gps/heading_factor_noise",   p.heading_factor_noise,  0.0076);
+    nh.param<double>("/gps/heading_velocity_gate",  p.heading_velocity_gate, 0.0);
     nh.param<bool>("/gps/lm_every_factor",       p.lm_every_factor,     false);
     nh.param<bool>("/gps/use_ground_prior",      p.use_ground_prior,    false);
 
@@ -82,7 +81,9 @@ BackendParams FastLioSamScQn::loadBackendParams(const ros::NodeHandle& nh)
 {
     BackendParams p;
     nh.param<int>("/gps/lm_max_factors",     p.max_lm_factors,    500);
-    nh.param<int>("/gps/lm_max_iterations",  p.lm_max_iterations, 20);
+    nh.param<int>(   "/gps/lm_max_iterations",  p.lm_max_iterations, 200);
+    nh.param<double>("/gps/lm_rel_tol",          p.lm_rel_tol,        1e-5);
+    nh.param<double>("/gps/lm_abs_tol",          p.lm_abs_tol,        1e-5);
     nh.param<int>("/gps/lm_max_passes",      p.lm_max_passes,     3);
     nh.param<double>("/gps/lm_max_distance", p.lm_max_distance,   50.0);
     nh.param<int>("/loop_closure/lm_passes", p.loop_lm_passes,    1);
@@ -91,6 +92,39 @@ BackendParams FastLioSamScQn::loadBackendParams(const ros::NodeHandle& nh)
     nh.param<double>("/loop_closure/noise_rot_scale",      p.loop_noise_rot_scale,    1.0);
     nh.param<double>("/loop_closure/noise_floor_pos",      p.loop_noise_floor_pos,    1.0);
     nh.param<double>("/loop_closure/max_yaw_diff_deg",     p.loop_max_yaw_diff_deg,   30.0);
+
+    // Per-axis odom noise — helper to load a 3-element XmlRpc array.
+    // XmlRpc may parse YAML values as TypeInt or TypeDouble; handle both and
+    // fall back to defaults on any type mismatch or missing key.
+    auto load3 = [&](const std::string& key, std::array<double,3>& arr,
+                     const std::array<double,3>& def)
+    {
+        XmlRpc::XmlRpcValue xv;
+        if (!nh.getParam(key, xv) ||
+            xv.getType() != XmlRpc::XmlRpcValue::TypeArray || xv.size() != 3)
+        {
+            arr = def;
+            return;
+        }
+        try
+        {
+            for (int i = 0; i < 3; ++i)
+            {
+                if (xv[i].getType() == XmlRpc::XmlRpcValue::TypeInt)
+                    arr[i] = static_cast<double>(static_cast<int>(xv[i]));
+                else
+                    arr[i] = static_cast<double>(xv[i]);
+            }
+        }
+        catch (...)
+        {
+            arr = def;
+        }
+    };
+    load3("/backend/odom_noise_rot",       p.odom_noise_rot,       {1e-4, 1e-4, 1e-4});
+    load3("/backend/odom_noise_pos",       p.odom_noise_pos,       {1e-2, 1e-2, 1e-2});
+    load3("/backend/odom_noise_rot_degen", p.odom_noise_rot_degen, {1e-2, 1e-2, 1e-2});
+    load3("/backend/odom_noise_pos_degen", p.odom_noise_pos_degen, {1e-1, 1e-1, 1e-1});
     return p;
 }
 
@@ -121,6 +155,10 @@ void FastLioSamScQn::loadParams(LoopClosureConfig& lc_config, double& loop_hz, d
     nh_.param<int>("/keyframe/nusubmap_keyframes",            lc_config.num_submap_keyframes_, 5);
     nh_.param<bool>("/keyframe/enable_submap_matching",       lc_config.enable_submap_matching_, false);
     /* ScanContext */
+    nh_.param<double>("/scancontext_dist_threshold",
+                      lc_config.scancontext_dist_thres_, 0.2);
+    nh_.param<double>("/scancontext_max_radius",
+                      lc_config.scancontext_max_radius_, 80.0);
     nh_.param<double>("/scancontext_max_correspondence_distance",
                       lc_config.scancontext_max_correspondence_distance_, 35.0);
     /* nano (GICP) */
@@ -146,9 +184,7 @@ void FastLioSamScQn::loadParams(LoopClosureConfig& lc_config, double& loop_hz, d
     nh_.param<double>("/quatro/rotation/rot_cost_diff_threshold",qc.rot_cost_diff_thr_, 0.0001);
     nh_.param<int>("/quatro/rotation/numax_iter",               qc.quatro_max_iter_,   50);
     /* results */
-    nh_.param<bool>("/result/save_map_bag",        save_map_bag_,         false);
     nh_.param<bool>("/result/save_map_pcd",        save_map_pcd_,         false);
-    nh_.param<bool>("/result/save_in_kitti_format",save_in_kitti_format_, false);
     nh_.param<std::string>("/result/seq_name",     seq_name_,             "");
     /* GPS topics */
     nh_.param<std::string>("/gps/topic",           gps_topic,     "/gps/odometry");
@@ -221,8 +257,12 @@ void FastLioSamScQn::setupRos(double loop_hz, double vis_hz,
     sub_save_flag_ = nh_.subscribe(t_save_dir, 1, &FastLioSamScQn::saveFlagCallback, this);
 
     lm_refine_srv_ = nh_.advertiseService("run_lm_refinement",
-                                           &FastLioSamScQn::lmRefineSrvCallback, this);
+                                           &FastLioSamScQn::lmRefineSrvCallback, this);  // grover_msgs/SrvInt16: data = passes (0 = use config default)
     ROS_INFO("[SLAM] LM refinement service ready at %s/run_lm_refinement", nh_.getNamespace().c_str());
+
+    save_map_srv_ = nh_.advertiseService("save_map",
+                                          &FastLioSamScQn::saveMapSrvCallback, this);
+    ROS_INFO("[SLAM] Save-map service ready at %s/save_map", nh_.getNamespace().c_str());
 
     sub_gps_ = nh_.subscribe(gps_topic, 200, &GpsHandler::onGpsOdom, &gps_handler_,
                               ros::TransportHints().tcpNoDelay());
@@ -295,8 +335,8 @@ FastLioSamScQn::~FastLioSamScQn()
         cloud_sparsify_stop_.store(true);
         cloud_sparsify_thread_.join();
     }
-    saveMapBag(package_path_ + "/result.bag");
-    saveMapPcd(package_path_ + "/result.pcd");
+    if (save_map_pcd_)
+        saveMapPcd(package_path_);
 }
 
 // ── odomPcdCallback ───────────────────────────────────────────────────────────
@@ -447,6 +487,26 @@ void FastLioSamScQn::publishRealtimePose(const nav_msgs::OdometryConstPtr& odom_
             slam_odom.child_frame_id  = robot_frame_;
             slam_odom.pose.pose       = poseEigToPoseStamped(current_frame_.pose_corrected_eig_, map_frame_).pose;
             slam_odom.twist           = odom_msg->twist;
+
+            // Populate pose covariance from the ISAM2 marginal of the last committed keyframe.
+            // pose_covariance_ is in GTSAM body-frame tangent space ordering: [Rx,Ry,Rz, tx,ty,tz].
+            // Step 1: rotate body-frame covariance into the world (map) frame — J = diag(R, R).
+            // Step 2: reorder blocks from GTSAM [R,T] to ROS [T,R] convention.
+            {
+                const Eigen::Matrix3d R = current_frame_.pose_corrected_eig_.block<3,3>(0,0);
+                Eigen::Matrix<double,6,6> J = Eigen::Matrix<double,6,6>::Zero();
+                J.block<3,3>(0,0) = R;
+                J.block<3,3>(3,3) = R;
+                const Eigen::Matrix<double,6,6> wc = J * pose_covariance_ * J.transpose();
+                // Swap [R,T] → [T,R] blocks for ROS nav_msgs/Odometry convention.
+                Eigen::Matrix<double,6,6> ros_cov;
+                ros_cov.block<3,3>(0,0) = wc.block<3,3>(3,3);  // T-T
+                ros_cov.block<3,3>(0,3) = wc.block<3,3>(3,0);  // T-R
+                ros_cov.block<3,3>(3,0) = wc.block<3,3>(0,3);  // R-T
+                ros_cov.block<3,3>(3,3) = wc.block<3,3>(0,0);  // R-R
+                Eigen::Map<Eigen::Matrix<double,6,6,Eigen::RowMajor>>(
+                    slam_odom.pose.covariance.data()) = ros_cov;
+            }
             slam_odom_pub_.publish(slam_odom);
         }
         if (publish_tf_)
@@ -507,6 +567,8 @@ void FastLioSamScQn::tryInitialize()
     gtsam::Pose3 init_pose = poseEigToGtsamPose(init_tf_source);
 
     const GpsHandler::InitSnapshot snap = gps_handler_.getInitSnapshot();
+    init_lat_ = snap.lat;
+    init_lon_ = snap.lon;
     if (!std::isnan(snap.yaw))
     {
         const gtsam::Rot3 lio_rot = init_pose.rotation();
@@ -581,15 +643,10 @@ void FastLioSamScQn::processKeyframe(const nav_msgs::OdometryConstPtr& odom_msg)
     bool structural = false;
 
     // GPS position (and optional GPS-derived heading) factor.
-    Eigen::MatrixXd slam_cov;
-    {
-        std::lock_guard<std::mutex> lk(realtime_pose_mutex_);
-        slam_cov = pose_covariance_;
-    }
     auto gps_result = gps_handler_.tryAddFactor(odom_msg->header.stamp.toSec(), curr_idx,
                                                   gps_total_path_length_,
                                                   current_frame_.pose_corrected_eig_(2,3),
-                                                  slam_cov, kf_factors);
+                                                  kf_factors);
     if (gps_result.factor_added)
     {
         structural = true;
@@ -603,23 +660,44 @@ void FastLioSamScQn::processKeyframe(const nav_msgs::OdometryConstPtr& odom_msg)
         gps_constraint_pub_.publish(gps_handler_.getGpsMarkers(map_frame_));
     }
 
-    // IMU heading yaw PriorFactor.
+    // IMU heading yaw PriorFactor — only when robot is (near-)stationary
+    // and the heading message is within 100 ms of the keyframe timestamp.
     auto hdg = gps_handler_.consumeHeading();
     if (hdg.fresh)
     {
-        structural = true;
-        const double noise_floor = gps_handler_.params().heading_factor_noise;
-        const double hcov = (hdg.cov > 1e-9)
-            ? std::max(hdg.cov, noise_floor)
-            : noise_floor;
-        auto yaw_noise = gtsam::noiseModel::Diagonal::Variances(
-            (gtsam::Vector(6) << 1e6, 1e6, hcov, 1e6, 1e6, 1e6).finished());
-        kf_factors.add(gtsam::PriorFactor<gtsam::Pose3>(
-            curr_idx,
-            gtsam::Pose3(gtsam::Rot3::Rz(hdg.yaw), pose_to.translation()),
-            yaw_noise));
-        ROS_INFO("\033[1;33m[Heading] Yaw PriorFactor at node %d yaw=%.1f° (cov=%.4f rad²)\033[0m",
-                 curr_idx, hdg.yaw * 180.0 / M_PI, hdg.cov);
+        static constexpr double kHdgSyncWindow = 0.1;
+        const double kf_time = odom_msg->header.stamp.toSec();
+        const double hdg_age = std::abs(hdg.stamp - kf_time);
+        if (hdg_age > kHdgSyncWindow)
+        {
+            ROS_DEBUG("[Heading] Skipped: %.3f s from keyframe (> %.3f s window)", hdg_age, kHdgSyncWindow);
+        }
+        else
+        {
+            const auto& tv = odom_msg->twist.twist.linear;
+            const double speed = std::sqrt(tv.x*tv.x + tv.y*tv.y + tv.z*tv.z);
+            const double vel_gate = gps_handler_.params().heading_velocity_gate;
+            if (vel_gate > 0.0 && speed > vel_gate)
+            {
+                ROS_DEBUG("[Heading] Skipped: speed=%.2f m/s > gate=%.2f m/s", speed, vel_gate);
+            }
+            else
+            {
+                structural = true;
+                const double noise_floor = gps_handler_.params().heading_factor_noise;
+                const double hcov = (hdg.cov > 1e-9)
+                    ? std::max(hdg.cov, noise_floor)
+                    : noise_floor;
+                auto yaw_noise = gtsam::noiseModel::Diagonal::Variances(
+                    (gtsam::Vector(6) << 1e6, 1e6, hcov, 1e6, 1e6, 1e6).finished());
+                kf_factors.add(gtsam::PriorFactor<gtsam::Pose3>(
+                    curr_idx,
+                    gtsam::Pose3(gtsam::Rot3::Rz(hdg.yaw), pose_to.translation()),
+                    yaw_noise));
+                ROS_INFO("\033[1;33m[Heading] Yaw PriorFactor at node %d yaw=%.1f° (cov=%.4f rad²) speed=%.2f m/s age=%.3f s\033[0m",
+                         curr_idx, hdg.yaw * 180.0 / M_PI, hdg.cov, speed, hdg_age);
+            }
+        }
     }
 
     // Ground Z prior.
@@ -835,8 +913,8 @@ void FastLioSamScQn::visTimerFunc(const ros::TimerEvent& /*event*/)
 
 // ── lmRefineSrvCallback ───────────────────────────────────────────────────────
 
-bool FastLioSamScQn::lmRefineSrvCallback(std_srvs::Trigger::Request& /*req*/,
-                                           std_srvs::Trigger::Response& res)
+bool FastLioSamScQn::lmRefineSrvCallback(grover_msgs::SrvInt16::Request& req,
+                                           grover_msgs::SrvInt16::Response& res)
 {
     if (!is_initialized_)
     {
@@ -846,7 +924,12 @@ bool FastLioSamScQn::lmRefineSrvCallback(std_srvs::Trigger::Request& /*req*/,
     }
 
     const BackendParams& bp = isam_backend_.params();
-    const bool ok = isam_backend_.runLMRefinement(bp.lm_max_passes, "SRV");
+    // req.data == 0  → use the config default (lm_max_passes).
+    // req.data  > 0  → use that many passes, capped at 100.
+    const int requested = static_cast<int>(req.data);
+    const int passes = (requested <= 0) ? bp.lm_max_passes
+                                        : std::min(requested, 100);
+    const bool ok = isam_backend_.runLMRefinement(passes, "SRV");
     if (!ok)
     {
         res.success = false;
@@ -884,75 +967,33 @@ bool FastLioSamScQn::lmRefineSrvCallback(std_srvs::Trigger::Request& /*req*/,
 
 void FastLioSamScQn::saveFlagCallback(const std_msgs::String::ConstPtr& msg)
 {
-    const std::string save_dir = msg->data.empty() ? package_path_ : msg->data;
-    const std::string seq_dir  = save_dir + "/" + seq_name_;
-
-    if (save_in_kitti_format_)
-    {
-        const std::string scans_dir = seq_dir + "/scans";
-        ROS_INFO("\033[1;32m[Save] Scans → %s (KITTI/TUM format)\033[0m", scans_dir.c_str());
-        if (fs::exists(seq_dir)) fs::remove_all(seq_dir);
-        fs::create_directories(scans_dir);
-
-        std::ofstream kitti_f(seq_dir + "/poses_kitti.txt");
-        std::ofstream tum_f(seq_dir + "/poses_tum.txt");
-        tum_f << "#timestamp x y z qx qy qz qw\n";
-        {
-            std::lock_guard<std::mutex> lk(keyframes_mutex_);
-            for (size_t i = 0; i < keyframes_.size(); ++i)
-            {
-                std::ostringstream ss;
-                ss << scans_dir << "/" << std::setw(6) << std::setfill('0') << i << ".pcd";
-                pcl::io::savePCDFileASCII<PointType>(ss.str(), keyframes_[i].pcd_);
-
-                const auto& p = keyframes_[i].pose_corrected_eig_;
-                kitti_f << p(0,0) << " " << p(0,1) << " " << p(0,2) << " " << p(0,3) << " "
-                        << p(1,0) << " " << p(1,1) << " " << p(1,2) << " " << p(1,3) << " "
-                        << p(2,0) << " " << p(2,1) << " " << p(2,2) << " " << p(2,3) << "\n";
-
-                const auto& ps = poseEigToPoseStamped(keyframes_[i].pose_corrected_eig_);
-                tum_f << std::fixed << std::setprecision(8) << keyframes_[i].timestamp_
-                      << " " << ps.pose.position.x << " " << ps.pose.position.y
-                      << " " << ps.pose.position.z
-                      << " " << ps.pose.orientation.x << " " << ps.pose.orientation.y
-                      << " " << ps.pose.orientation.z << " " << ps.pose.orientation.w << "\n";
-            }
-        }
-        ROS_INFO("\033[1;32m[Save] Scans and poses saved (PCD + KITTI)\033[0m");
-    }
-
-    saveMapBag(package_path_ + "/result.bag");
-    saveMapPcd(seq_dir + "/" + seq_name_ + "_map.pcd");
+    if (!save_map_pcd_) return;
+    const std::string base_dir = msg->data.empty() ? package_path_ : msg->data;
+    saveMapPcd(base_dir);
 }
 
-// ── saveMapBag ────────────────────────────────────────────────────────────────
-
-void FastLioSamScQn::saveMapBag(const std::string& bag_path)
-{
-    if (!save_map_bag_ || keyframes_.empty()) return;
-
-    rosbag::Bag bag;
-    bag.open(bag_path, rosbag::bagmode::Write);
-    {
-        std::lock_guard<std::mutex> lk(keyframes_mutex_);
-        for (size_t i = 0; i < keyframes_.size(); ++i)
-        {
-            ros::Time t;
-            t.fromSec(keyframes_[i].timestamp_);
-            bag.write("/keyframe_pcd",  t, pclToPclRos(keyframes_[i].pcd_, map_frame_));
-            bag.write("/keyframe_pose", t, poseEigToPoseStamped(keyframes_[i].pose_corrected_eig_));
-        }
-    }
-    bag.close();
-    ROS_INFO("\033[1;36m[Save] Result saved in .bag format → %s\033[0m", bag_path.c_str());
-}
 
 // ── saveMapPcd ────────────────────────────────────────────────────────────────
 
-void FastLioSamScQn::saveMapPcd(const std::string& pcd_path)
+std::string FastLioSamScQn::saveMapPcd(const std::string& base_dir)
 {
-    if (!save_map_pcd_ || keyframes_.empty()) return;
+    if (keyframes_.empty()) return {};
 
+    // Build timestamped subdirectory: base_dir/YYYY-MM-DD-HH-MM/
+    const std::time_t now = std::time(nullptr);
+    char ts[32];
+    std::strftime(ts, sizeof(ts), "%Y-%m-%d-%H-%M", std::localtime(&now));
+    const fs::path out_dir = fs::path(base_dir) / ts;
+
+    std::error_code ec;
+    fs::create_directories(out_dir, ec);
+    if (ec)
+    {
+        ROS_ERROR("[Save] Failed to create directory %s: %s", out_dir.c_str(), ec.message().c_str());
+        return {};
+    }
+
+    // Assemble voxelized map.
     pcl::PointCloud<PointType>::Ptr map(new pcl::PointCloud<PointType>());
     map->reserve(keyframes_[0].pcd_.size() * keyframes_.size());
     {
@@ -961,8 +1002,120 @@ void FastLioSamScQn::saveMapPcd(const std::string& pcd_path)
             *map += transformPcd(keyframes_[i].pcd_, keyframes_[i].pose_corrected_eig_);
     }
     const auto& voxelized = voxelizePcd(map, voxel_res_);
+
+    const std::string pcd_path  = (out_dir / "cloud.pcd").string();
+    const std::string yaml_path = (out_dir / "metadata.yaml").string();
+
     pcl::io::savePCDFileASCII<PointType>(pcd_path, *voxelized);
-    ROS_INFO("\033[1;32m[Save] Accumulated map saved in .pcd format → %s\033[0m", pcd_path.c_str());
+    ROS_INFO("\033[1;32m[Save] Map saved → %s  (%zu pts)\033[0m",
+             pcd_path.c_str(), voxelized->size());
+
+    // Write metadata.yaml
+    {
+        std::ofstream ofs(yaml_path);
+        ofs << std::fixed << std::setprecision(9);
+        ofs << "# SLAM map metadata — generated by fast_lio_sam_sc_qn\n";
+        ofs << "timestamp: \"" << ts << "\"\n";
+        ofs << "map_frame: \"" << map_frame_ << "\"\n";
+        ofs << "voxel_resolution: " << voxel_res_ << "\n";
+        ofs << "keyframes: " << keyframes_.size() << "\n";
+        ofs << "origin:\n";
+        ofs << "  description: \"GTSAM node 0 — position at SLAM initialisation\"\n";
+        if (!std::isnan(init_lat_) && !std::isnan(init_lon_))
+        {
+            ofs << "  latitude:  " << init_lat_ << "\n";
+            ofs << "  longitude: " << init_lon_ << "\n";
+        }
+        else
+        {
+            ofs << "  latitude:  null  # GPS fix not available at init\n";
+            ofs << "  longitude: null\n";
+        }
+    }
+    ROS_INFO("\033[1;32m[Save] Metadata → %s\033[0m", yaml_path.c_str());
+
+    // ── Session dump for offline PGO ──────────────────────────────────────────
+    // 1) keyframes.csv — pose snapshots (copied under lock, written outside)
+    {
+        struct KfSnap { int idx; double stamp; bool is_degenerate; Eigen::Matrix4d pose; };
+        std::vector<KfSnap> snaps;
+        {
+            std::lock_guard<std::mutex> lk(keyframes_mutex_);
+            snaps.reserve(keyframes_.size());
+            for (const auto& kf : keyframes_)
+                snaps.push_back({kf.idx_, kf.timestamp_, kf.is_degenerate_,
+                                 kf.pose_corrected_eig_});
+        }
+        std::ofstream kf_csv((out_dir / "keyframes.csv").string());
+        kf_csv << std::fixed << std::setprecision(9);
+        kf_csv << "idx,stamp,is_degenerate";
+        for (int i = 0; i < 16; ++i) kf_csv << ",m" << i;  // row-major in file (written below)
+        kf_csv << "\n";
+        for (const auto& s : snaps)
+        {
+            kf_csv << s.idx << "," << s.stamp << "," << static_cast<int>(s.is_degenerate);
+            for (int r = 0; r < 4; ++r)
+                for (int c = 0; c < 4; ++c)
+                    kf_csv << "," << s.pose(r, c);  // row-major in file
+            kf_csv << "\n";
+        }
+        ROS_INFO("\033[1;32m[Save] Keyframes → %s  (%zu rows)\033[0m",
+                 (out_dir / "keyframes.csv").c_str(), snaps.size());
+    }
+
+    // 2) Per-keyframe point clouds in sensor frame (for offline ICP).
+    //    Written under keyframes_mutex_ to guarantee a consistent snapshot.
+    {
+        const fs::path clouds_dir = out_dir / "clouds";
+        std::error_code ec2;
+        fs::create_directories(clouds_dir, ec2);
+        if (ec2)
+        {
+            ROS_ERROR("[Save] Cannot create clouds dir: %s", ec2.message().c_str());
+        }
+        else
+        {
+            char name[16];
+            std::lock_guard<std::mutex> lk(keyframes_mutex_);
+            for (const auto& kf : keyframes_)
+            {
+                std::snprintf(name, sizeof(name), "%06d.pcd", kf.idx_);
+                pcl::io::savePCDFileBinary((clouds_dir / name).string(), kf.pcd_);
+            }
+            ROS_INFO("\033[1;32m[Save] %zu keyframe clouds → %s/\033[0m",
+                     keyframes_.size(), clouds_dir.c_str());
+        }
+    }
+
+    // 3) SC descriptors
+    loop_closure_->saveDescriptors(out_dir.string());
+
+    return out_dir.string();
+}
+
+// ── saveMapSrvCallback ────────────────────────────────────────────────────────
+
+bool FastLioSamScQn::saveMapSrvCallback(std_srvs::Trigger::Request& /*req*/,
+                                         std_srvs::Trigger::Response& res)
+{
+    if (!is_initialized_ || keyframes_.empty())
+    {
+        res.success = false;
+        res.message = "SLAM not yet initialized — no map to save";
+        return true;
+    }
+
+    const std::string out_dir = saveMapPcd(package_path_);
+    if (out_dir.empty())
+    {
+        res.success = false;
+        res.message = "saveMapPcd failed — check logs";
+        return true;
+    }
+
+    res.success = true;
+    res.message = "Map saved to " + out_dir;
+    return true;
 }
 
 // ── lioDiagCallback ───────────────────────────────────────────────────────────

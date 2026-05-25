@@ -38,17 +38,10 @@ void IsamBackend::stageOdomFactor(int prev_key, int curr_key,
                                    const gtsam::Pose3& prev_pose, const gtsam::Pose3& curr_pose,
                                    bool is_degenerate)
 {
-    gtsam::noiseModel::Diagonal::shared_ptr odom_noise;
-    if (is_degenerate)
-    {
-        auto v = (gtsam::Vector(6) << 1e-2, 1e-2, 1e-2, 1e-1, 1e-1, 1e-1).finished();
-        odom_noise = gtsam::noiseModel::Diagonal::Variances(v);
-    }
-    else
-    {
-        auto v = (gtsam::Vector(6) << 1e-4, 1e-4, 1e-4, 1e-2, 1e-2, 1e-2).finished();
-        odom_noise = gtsam::noiseModel::Diagonal::Variances(v);
-    }
+    const auto& rot = is_degenerate ? p_.odom_noise_rot_degen : p_.odom_noise_rot;
+    const auto& pos = is_degenerate ? p_.odom_noise_pos_degen : p_.odom_noise_pos;
+    auto v = (gtsam::Vector(6) << rot[0], rot[1], rot[2], pos[0], pos[1], pos[2]).finished();
+    auto odom_noise = gtsam::noiseModel::Diagonal::Variances(v);
     staged_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
         prev_key, curr_key, prev_pose.between(curr_pose), odom_noise));
 }
@@ -268,8 +261,8 @@ bool IsamBackend::runLMRefinementLocked(int passes, const std::string& tag)
 
     gtsam::LevenbergMarquardtParams lm_params;
     lm_params.maxIterations    = static_cast<size_t>(std::max(p_.lm_max_iterations, 1));
-    lm_params.relativeErrorTol = 1e-4;
-    lm_params.absoluteErrorTol = 1e-4;
+    lm_params.relativeErrorTol = p_.lm_rel_tol;
+    lm_params.absoluteErrorTol = p_.lm_abs_tol;
 
     gtsam::Values lm_result;
     bool any_ok = false;

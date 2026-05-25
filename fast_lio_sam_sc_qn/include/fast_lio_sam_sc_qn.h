@@ -6,6 +6,7 @@
 #include <chrono>
 #include <fstream>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -14,7 +15,6 @@
 
 #include <ros/ros.h>
 #include <ros/package.h>
-#include <rosbag/bag.h>
 #include <tf/LinearMath/Quaternion.h>
 #include <tf/LinearMath/Matrix3x3.h>
 #include <tf/transform_datatypes.h>
@@ -23,6 +23,7 @@
 #include <tf/transform_listener.h>
 #include <std_msgs/String.h>
 #include <std_srvs/Trigger.h>
+#include <grover_msgs/SrvInt16.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/NavSatFix.h>
@@ -111,7 +112,9 @@ private:
     bool global_map_vis_switch_ = true;
 
     // ── Save ─────────────────────────────────────────────────────────────────
-    bool save_map_bag_ = false, save_map_pcd_ = false, save_in_kitti_format_ = false;
+    bool save_map_pcd_ = false;
+    double init_lat_   = std::numeric_limits<double>::quiet_NaN();
+    double init_lon_   = std::numeric_limits<double>::quiet_NaN();
 
     // ── Subsystems ───────────────────────────────────────────────────────────
     std::shared_ptr<LoopClosure> loop_closure_;
@@ -130,7 +133,7 @@ private:
     ros::Publisher gps_constraint_pub_;
 
     ros::Subscriber sub_save_flag_, sub_gps_, sub_gps_fix_, sub_heading_, sub_lio_diag_;
-    ros::ServiceServer lm_refine_srv_;
+    ros::ServiceServer lm_refine_srv_, save_map_srv_;
     ros::Timer loop_timer_, vis_timer_;
 
     std::shared_ptr<message_filters::Synchronizer<odom_pcd_sync_pol>> sub_odom_pcd_sync_;
@@ -177,7 +180,8 @@ private:
     void loopTimerFunc(const ros::TimerEvent& event);
     void visTimerFunc(const ros::TimerEvent& event);
     void lioDiagCallback(const voxel_slam::LIODiagConstPtr& msg);
-    bool lmRefineSrvCallback(std_srvs::Trigger::Request&, std_srvs::Trigger::Response&);
+    bool lmRefineSrvCallback(grover_msgs::SrvInt16::Request&, grover_msgs::SrvInt16::Response&);
+    bool saveMapSrvCallback(std_srvs::Trigger::Request&, std_srvs::Trigger::Response&);
     void perfTimerFunc(const ros::WallTimerEvent& event);
 
     // ── odomPcdCallback decomposition ────────────────────────────────────────
@@ -194,8 +198,9 @@ private:
     void cloudSparsifyThread();
 
     // ── Save map helpers ──────────────────────────────────────────────────────
-    void saveMapBag(const std::string& bag_path);
-    void saveMapPcd(const std::string& pcd_path);
+    /// Build a timestamped subdirectory under base_dir, write cloud.pcd and
+    /// metadata.yaml there.  Returns the directory path on success or "" on failure.
+    std::string saveMapPcd(const std::string& base_dir);
 };
 
 #endif // FAST_LIO_SAM_SC_QN_MAIN_H

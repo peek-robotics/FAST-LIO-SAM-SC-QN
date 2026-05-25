@@ -42,8 +42,6 @@ struct GpsParams
     bool require_gbas_for_init = false; ///< only allow GBAS_FIX for the init stability window
 
     // Covariance gates
-    bool   use_slam_cov_gate   = false;
-    double slam_cov_threshold  = 25.0;  ///< [m²] skip GPS if SLAM XY cov < this
     bool   use_elevation       = true;  ///< use GPS Z; false = substitute LIO Z
 
     // Spacing / traveled-distance gates
@@ -61,6 +59,7 @@ struct GpsParams
     double heading_cov_gate      = 0.1;    ///< [rad²] max yaw cov accepted from GPS odom msg
     double heading_noise_floor   = 0.01;   ///< [rad²] noise floor for GPS-derived yaw factor
     double heading_factor_noise  = 0.0076; ///< [rad²] default IMU heading topic factor noise
+    double heading_velocity_gate = 0.0;    ///< [m/s]  skip heading factor if |v_linear| exceeds this; 0 = disabled
 
     // LM triggers
     bool lm_every_factor = false;  ///< run LM on every accepted GPS factor, not just re-entry
@@ -97,6 +96,8 @@ public:
         double y   = 0.0;
         double z   = 0.0;
         double yaw = std::numeric_limits<double>::quiet_NaN(); ///< NaN = no heading available
+        double lat = std::numeric_limits<double>::quiet_NaN(); ///< WGS-84 latitude  [deg]
+        double lon = std::numeric_limits<double>::quiet_NaN(); ///< WGS-84 longitude [deg]
     };
 
     /// Heading reading consumed once per keyframe.
@@ -105,6 +106,7 @@ public:
         bool   fresh = false;
         double yaw   = 0.0;
         double cov   = 0.0;
+        double stamp = 0.0;  ///< header.stamp of the source IMU message [s]
     };
 
     explicit GpsHandler(const GpsParams& p);
@@ -123,11 +125,9 @@ public:
 
     // ── Per-keyframe GPS factor ───────────────────────────────────────────────
     /// Attempts to add GPS position (and optional GPS-derived yaw) factors into
-    /// graph_out.  slam_cov is the 6×6 ISAM2 marginal covariance (for the SLAM
-    /// covariance gate).  Returns metadata about what was added.
+    /// graph_out.  Returns metadata about what was added.
     FactorResult tryAddFactor(double kf_time, int node_idx,
                               double traveled_dist, double current_z,
-                              const Eigen::MatrixXd& slam_cov,
                               gtsam::NonlinearFactorGraph& graph_out);
 
     // ── Continuous heading factor (IMU heading topic) ─────────────────────────
@@ -160,6 +160,8 @@ private:
     double latest_gps_x_       = 0.0;
     double latest_gps_y_       = 0.0;
     double latest_gps_z_       = 0.0;
+    double latest_lat_         = std::numeric_limits<double>::quiet_NaN();
+    double latest_lon_         = std::numeric_limits<double>::quiet_NaN();
 
     // Init stability window
     struct InitSample { double yaw, x, y, z; };
@@ -170,11 +172,14 @@ private:
     double init_gps_x_           = 0.0;
     double init_gps_y_           = 0.0;
     double init_gps_z_           = 0.0;
+    double init_lat_             = std::numeric_limits<double>::quiet_NaN();
+    double init_lon_             = std::numeric_limits<double>::quiet_NaN();
 
     // Continuous heading state (IMU heading topic)
     mutable std::mutex heading_mutex_;
     double latest_heading_yaw_   = 0.0;
     double latest_heading_cov_   = 0.0;
+    double latest_heading_stamp_ = 0.0;
     bool   latest_heading_fresh_ = false;
 
     // GPS factor bookkeeping (promoted from function-static locals in original code)
@@ -187,6 +192,7 @@ private:
     // Visualization data
     std::vector<pcl::PointXYZ>   gps_constraint_points_;
     std::vector<Eigen::Vector3f> gps_constraint_noises_;
+    std::vector<int8_t>          gps_constraint_fix_status_;  // STATUS_GBAS_FIX=2, STATUS_SBAS_FIX=1
 
     // ── Private helpers ───────────────────────────────────────────────────────
     /// Looks up the quality tier for a GPS odometry message.

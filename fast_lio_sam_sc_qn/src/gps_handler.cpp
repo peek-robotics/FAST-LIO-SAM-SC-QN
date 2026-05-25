@@ -41,13 +41,13 @@ bool GpsHandler::hasGpsConstraints() const
 
 GpsHandler::InitSnapshot GpsHandler::getInitSnapshot() const
 {
-    return {init_gps_x_, init_gps_y_, init_gps_z_, gps_initial_yaw_};
+    return {init_gps_x_, init_gps_y_, init_gps_z_, gps_initial_yaw_, init_lat_, init_lon_};
 }
 
 GpsHandler::HeadingSnapshot GpsHandler::consumeHeading()
 {
     std::lock_guard<std::mutex> lk(heading_mutex_);
-    HeadingSnapshot s{latest_heading_fresh_, latest_heading_yaw_, latest_heading_cov_};
+    HeadingSnapshot s{latest_heading_fresh_, latest_heading_yaw_, latest_heading_cov_, latest_heading_stamp_};
     latest_heading_fresh_ = false;
     return s;
 }
@@ -57,8 +57,15 @@ GpsHandler::HeadingSnapshot GpsHandler::consumeHeading()
 void GpsHandler::onNavSatFix(const sensor_msgs::NavSatFixConstPtr& msg)
 {
     latest_fix_status_.store(msg->status.status);
-    std::lock_guard<std::mutex> lk(fix_mutex_);
-    fix_queue_.push_back(*msg);
+    {
+        std::lock_guard<std::mutex> lk(fix_mutex_);
+        fix_queue_.push_back(*msg);
+    }
+    // Cache raw WGS-84 lat/lon for metadata export.
+    // Protected by gps_mutex_ to avoid a separate lock.
+    std::lock_guard<std::mutex> lk(gps_mutex_);
+    latest_lat_ = msg->latitude;
+    latest_lon_ = msg->longitude;
 }
 
 void GpsHandler::onGpsOdom(const nav_msgs::OdometryConstPtr& msg)
@@ -103,6 +110,7 @@ void GpsHandler::onHeading(const sensor_msgs::ImuConstPtr& msg)
         std::lock_guard<std::mutex> lk(heading_mutex_);
         latest_heading_yaw_   = yaw;
         latest_heading_cov_   = msg->orientation_covariance[8];
+        latest_heading_stamp_ = msg->header.stamp.toSec();
         latest_heading_fresh_ = true;
     }
 }
@@ -129,6 +137,11 @@ void GpsHandler::finalizeInit(double yaw, double x, double y, double z)
     init_gps_x_           = x;
     init_gps_y_           = y;
     init_gps_z_           = z;
+    {
+        std::lock_guard<std::mutex> lk(gps_mutex_);
+        init_lat_ = latest_lat_;
+        init_lon_ = latest_lon_;
+    }
     gps_heading_received_ = true;
 }
 
@@ -292,7 +305,6 @@ const GpsFixTier* GpsHandler::resolveFixTier(double msg_time)
 GpsHandler::FactorResult GpsHandler::tryAddFactor(
     double kf_time, int node_idx,
     double traveled_dist, double current_z,
-    const Eigen::MatrixXd& slam_cov,
     gtsam::NonlinearFactorGraph& graph_out)
 {
     FactorResult result;
@@ -313,30 +325,23 @@ GpsHandler::FactorResult GpsHandler::tryAddFactor(
         return result;
     }
 
-    // Optional SLAM covariance gate.
-    if (p_.use_slam_cov_gate &&
-        slam_cov(3, 3) < p_.slam_cov_threshold && slam_cov(4, 4) < p_.slam_cov_threshold)
-    {
-        ROS_INFO_THROTTLE(5.0, "[GPS] Skipping: SLAM cov (%.4f, %.4f) below threshold %.4f",
-                          slam_cov(3, 3), slam_cov(4, 4), p_.slam_cov_threshold);
-        return result;
-    }
-
-    // Time-sync: find a GPS message within ±0.5 s of the keyframe timestamp.
+    // Time-sync: GPS @ 5 Hz → max inter-message gap 0.2 s, so ±0.1 s keeps us within
+    // half a GPS period of the keyframe and avoids applying a fix from a different pose.
+    static constexpr double kGpsSyncWindow = 0.1;
     while (!gps_queue_.empty())
     {
         const double msg_time = gps_queue_.front().header.stamp.toSec();
-        if (msg_time < kf_time - 0.5)
+        if (msg_time < kf_time - kGpsSyncWindow)
         {
             ROS_DEBUG_THROTTLE(5.0, "[GPS] Time-sync: dropping old message (%.3f s behind keyframe)",
                                kf_time - msg_time);
             gps_queue_.pop_front();
             continue;
         }
-        if (msg_time > kf_time + 0.5)
+        if (msg_time > kf_time + kGpsSyncWindow)
         {
-            ROS_INFO_THROTTLE(5.0, "[GPS] No sync: nearest msg %.3f s ahead of keyframe",
-                              msg_time - kf_time);
+            ROS_DEBUG_THROTTLE(5.0, "[GPS] No sync: nearest msg %.3f s ahead of keyframe",
+                               msg_time - kf_time);
             break;
         }
 
@@ -444,6 +449,12 @@ GpsHandler::FactorResult GpsHandler::tryAddFactor(
         gps_constraint_noises_.push_back(Eigen::Vector3f(static_cast<float>(gps_noise_vec[0]),
                                                           static_cast<float>(gps_noise_vec[1]),
                                                           static_cast<float>(gps_noise_vec[2])));
+        {
+            int8_t fix_status = sensor_msgs::NavSatStatus::STATUS_FIX;
+            for (const auto& kv : p_.fix_tiers)
+                if (&kv.second == tier) { fix_status = kv.first; break; }
+            gps_constraint_fix_status_.push_back(fix_status);
+        }
 
         ROS_INFO("\033[1;36m[GPS] Factor @node %d  pos=(%.1f, %.1f, %.1f)"
                  "  σ_raw=(%.3f, %.3f)  σ_eff=(%.3f, %.3f, %.3f)\033[0m",
@@ -510,7 +521,13 @@ visualization_msgs::MarkerArray GpsHandler::getGpsMarkers(const std::string& map
         node.scale.x = 2.0f * sx;
         node.scale.y = 2.0f * sy;
         node.scale.z = 2.0f * sz;
-        node.color.r = 0.0f; node.color.g = 1.0f; node.color.b = 0.4f; node.color.a = 0.5f;
+        // GBAS (RTK): bright green  SBAS (WAAS): yellowish-green
+        const bool is_gbas = (i < gps_constraint_fix_status_.size()) &&
+                             (gps_constraint_fix_status_[i] == sensor_msgs::NavSatStatus::STATUS_GBAS_FIX);
+        if (is_gbas)
+            { node.color.r = 0.0f; node.color.g = 0.9f; node.color.b = 0.1f; node.color.a = 0.6f; }
+        else
+            { node.color.r = 0.6f; node.color.g = 0.9f; node.color.b = 0.0f; node.color.a = 0.5f; }
         ma.markers.push_back(node);
     }
 
@@ -525,7 +542,7 @@ visualization_msgs::MarkerArray GpsHandler::getGpsMarkers(const std::string& map
         edges.action             = visualization_msgs::Marker::ADD;
         edges.pose.orientation.w = 1.0;
         edges.scale.x            = 0.15;
-        edges.color.r = 0.0f; edges.color.g = 0.8f; edges.color.b = 0.2f; edges.color.a = 0.8f;
+        edges.color.r = 0.1f; edges.color.g = 0.85f; edges.color.b = 0.05f; edges.color.a = 0.8f;
         for (const auto& pt : gps_constraint_points_)
         {
             geometry_msgs::Point p;
