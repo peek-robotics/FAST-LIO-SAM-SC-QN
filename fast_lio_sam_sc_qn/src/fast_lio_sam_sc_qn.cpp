@@ -241,10 +241,15 @@ void FastLioSamScQn::setupRos(double loop_hz, double vis_hz,
     realtime_pose_pub_         = nh_.advertise<geometry_msgs::PoseStamped>(t_pose, 10);
     slam_odom_pub_             = nh_.advertise<nav_msgs::Odometry>(t_slam_odom, 10);
     gps_constraint_pub_        = nh_.advertise<visualization_msgs::MarkerArray>(t_gps, 10, true);
-    debug_src_pub_             = nh_.advertise<sensor_msgs::PointCloud2>("/src", 10, true);
-    debug_dst_pub_             = nh_.advertise<sensor_msgs::PointCloud2>("/dst", 10, true);
-    debug_coarse_aligned_pub_  = nh_.advertise<sensor_msgs::PointCloud2>("/coarse_aligned_quatro", 10, true);
-    debug_fine_aligned_pub_    = nh_.advertise<sensor_msgs::PointCloud2>("/fine_aligned_nano_gicp", 10, true);
+    nh_.param<bool>("/basic/pub_debug_clouds", pub_debug_clouds_, false);
+    if (pub_debug_clouds_)
+    {
+        debug_src_pub_            = nh_.advertise<sensor_msgs::PointCloud2>("debug/src",            10, true);
+        debug_dst_pub_            = nh_.advertise<sensor_msgs::PointCloud2>("debug/dst",            10, true);
+        debug_coarse_aligned_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("debug/coarse_aligned", 10, true);
+        debug_fine_aligned_pub_   = nh_.advertise<sensor_msgs::PointCloud2>("debug/fine_aligned",   10, true);
+        ROS_INFO("[SLAM] Debug cloud publishers enabled under %s/debug/", nh_.getNamespace().c_str());
+    }
 
     /* subscribers */
     sub_odom_ = std::make_shared<message_filters::Subscriber<nav_msgs::Odometry>>(nh_, t_input_odom, 10);
