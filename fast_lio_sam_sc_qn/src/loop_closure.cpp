@@ -80,7 +80,7 @@ void LoopClosure::saveDescriptors(const std::string& out_dir) const
         // Eigen matrices are column-major; write data() directly
         ofs.write(reinterpret_cast<const char*>(m.data()), sizeof(double) * rows * cols);
     }
-    ROS_INFO("\033[1;32m[Save] SC descriptors \u2192 %s  (%u descriptors)\033[0m",
+    ROS_INFO("\033[1;32m[Save] SC descriptors -> %s  (%u descriptors)\033[0m",
              path.c_str(), count);
 }
 
@@ -104,12 +104,12 @@ int LoopClosure::fetchCandidateKeyframeIdx(const PosePcd &query_keyframe,
          - query_keyframe.pose_corrected_eig_.block<3, 1>(0, 3)).norm();
     if (spatial_dist < config_.scancontext_max_correspondence_distance_)
     {
-        ROS_INFO("[Loop] SC match: kf %d → candidate kf %d  sc_dist=%.3f  spatial_dist=%.1fm",
+        ROS_INFO("[Loop] SC match: kf %d -> candidate kf %d  sc_dist=%.3f  spatial_dist=%.1fm",
                  query_keyframe.idx_, candidate_keyframe_idx, sc_dist, spatial_dist);
         return candidate_keyframe_idx;
     }
     ROS_INFO_THROTTLE(2.0,
-        "[Loop] SC match kf %d → candidate kf %d (sc_dist=%.3f) BLOCKED by spatial gate: "
+        "[Loop] SC match kf %d -> candidate kf %d (sc_dist=%.3f) BLOCKED by spatial gate: "
         "%.1fm > %.1fm",
         query_keyframe.idx_, candidate_keyframe_idx, sc_dist,
         spatial_dist, config_.scancontext_max_correspondence_distance_);

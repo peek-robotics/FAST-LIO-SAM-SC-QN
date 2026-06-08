@@ -18,7 +18,7 @@ FastLioSamScQn::FastLioSamScQn(const ros::NodeHandle& n_private)
     setupRos(loop_hz, vis_hz, gps_topic, fix_topic, heading_topic);
     initComponents(lc_config);
 
-    ROS_INFO("[Init] Node starting — map: %s  robot: %s  loop: %.1f Hz  vis: %.1f Hz",
+    ROS_INFO("[Init] Node starting -- map: %s  robot: %s  loop: %.1f Hz  vis: %.1f Hz",
              map_frame_.c_str(), robot_frame_.c_str(), loop_hz, vis_hz);
 }
 
@@ -46,7 +46,7 @@ GpsParams FastLioSamScQn::loadGpsParams(const ros::NodeHandle& nh)
         nh.param<double>("/gps/fix_tiers/sbas/cov_scale",   sbas.cov_scale,   100.0);
         p.fix_tiers[sensor_msgs::NavSatStatus::STATUS_GBAS_FIX] = gbas;
         p.fix_tiers[sensor_msgs::NavSatStatus::STATUS_SBAS_FIX] = sbas;
-        ROS_INFO("[GPS] Fix-type quality tiers enabled (%s) — SLAM init requires GBAS_FIX", fix_topic.c_str());
+        ROS_INFO("[GPS] Fix-type quality tiers enabled (%s) -- SLAM init requires GBAS_FIX", fix_topic.c_str());
         ROS_INFO("[GPS]   GBAS(2): cov_gate=%.3f  noise_floor=%.3f  cov_scale=%.1f",
                  gbas.cov_gate, gbas.noise_floor, gbas.cov_scale);
         ROS_INFO("[GPS]   SBAS(1): cov_gate=%.3f  noise_floor=%.3f  cov_scale=%.1f",
@@ -57,10 +57,10 @@ GpsParams FastLioSamScQn::loadGpsParams(const ros::NodeHandle& nh)
     nh.param<double>("/gps/min_spacing",         p.min_spacing,         5.0);
     nh.param<double>("/gps/min_traveled_dist",   p.min_traveled_dist,   5.0);
     nh.param<int>("/gps/re_entry_skip_count",    p.re_entry_skip_count, 2);
-    nh.param<double>("/gps/heading_cov_gate",      p.heading_cov_gate,      0.1);
-    nh.param<double>("/gps/heading_noise_floor",    p.heading_noise_floor,   0.01);
-    nh.param<double>("/gps/heading_factor_noise",   p.heading_factor_noise,  0.0076);
-    nh.param<double>("/gps/heading_velocity_gate",  p.heading_velocity_gate, 0.0);
+    nh.param<double>("/gps/heading_noise_floor",    p.heading_noise_floor,   0.05);
+    nh.param<bool>("/gps/use_cog_heading",           p.use_cog_heading,       false);
+    nh.param<double>("/gps/cog_noise_floor",         p.cog_noise_floor,       0.05);
+    nh.param<double>("/gps/best_fix_window",        p.best_fix_window,       0.0);
     nh.param<bool>("/gps/lm_every_factor",       p.lm_every_factor,     false);
     nh.param<bool>("/gps/use_ground_prior",      p.use_ground_prior,    false);
 
@@ -326,7 +326,7 @@ void FastLioSamScQn::initComponents(const LoopClosureConfig& lc_config)
                      tf_stamped.getOrigin().x(), tf_stamped.getOrigin().y(), tf_stamped.getOrigin().z());
         }
         else
-            ROS_WARN("[Init] TF %s -> %s not available within 2 s — starting at origin",
+            ROS_WARN("[Init] TF %s -> %s not available within 2 s -- starting at origin",
                      map_frame_.c_str(), robot_frame_.c_str());
     }
 }
@@ -413,7 +413,7 @@ bool FastLioSamScQn::passLioHealthChecks(const nav_msgs::OdometryConstPtr& odom_
     const double jump_dist = frame_delta.norm();
     if (first_odom_received_ && jump_dist > max_odom_jump_m_)
     {
-        ROS_WARN_THROTTLE(1.0, "[LIO] Jump detected: %.2f m (threshold %.2f m) — dropping frame",
+        ROS_WARN_THROTTLE(1.0, "[LIO] Jump detected: %.2f m (threshold %.2f m) -- dropping frame",
                           jump_dist, max_odom_jump_m_);
         perf_frames_dropped_.fetch_add(1, std::memory_order_relaxed);
 
@@ -438,13 +438,13 @@ bool FastLioSamScQn::passLioHealthChecks(const nav_msgs::OdometryConstPtr& odom_
                         std::lock_guard<std::mutex> lk(realtime_pose_mutex_);
                         last_corrected_pose_ = anchor;
                     }
-                    ROS_INFO("[LIO] Re-anchor from TF %s -> %s: t=(%.2f, %.2f, %.2f) — map preserved (%zu kf)",
+                    ROS_INFO("[LIO] Re-anchor from TF %s -> %s: t=(%.2f, %.2f, %.2f) -- map preserved (%zu kf)",
                              map_frame_.c_str(), robot_frame_.c_str(),
                              anchor(0,3), anchor(1,3), anchor(2,3), keyframes_.size());
                 }
                 catch (const tf::TransformException& ex)
                 {
-                    ROS_WARN("[LIO] TF lookup failed for re-anchor (%s) — keeping last corrected pose", ex.what());
+                    ROS_WARN("[LIO] TF lookup failed for re-anchor (%s) -- keeping last corrected pose", ex.what());
                 }
             }
             gps_handler_.armReentry();
@@ -559,7 +559,7 @@ void FastLioSamScQn::tryInitialize()
             }
             catch (const tf::TransformException& ex)
             {
-                ROS_WARN("[Init] TF lookup failed at init time (%s) — using accumulated LIO position", ex.what());
+                ROS_WARN("[Init] TF lookup failed at init time (%s) -- using accumulated LIO position", ex.what());
             }
         }
         heading_tf_captured_ = true;
@@ -579,7 +579,7 @@ void FastLioSamScQn::tryInitialize()
         const gtsam::Rot3 lio_rot = init_pose.rotation();
         const gtsam::Rot3 gps_rot = gtsam::Rot3::RzRyRx(lio_rot.roll(), lio_rot.pitch(), snap.yaw);
         init_pose = gtsam::Pose3(gps_rot, init_pose.translation());
-        ROS_INFO("\033[1;32m[Init] Using GPS heading yaw=%.1f° for GTSAM prior.\033[0m",
+        ROS_INFO("\033[1;32m[Init] Using GPS heading yaw=%.1f deg for GTSAM prior.\033[0m",
                  snap.yaw * 180.0 / M_PI);
     }
     init_pose = gtsam::Pose3(init_pose.rotation(), gtsam::Point3(snap.x, snap.y, snap.z));
@@ -665,46 +665,6 @@ void FastLioSamScQn::processKeyframe(const nav_msgs::OdometryConstPtr& odom_msg)
         gps_constraint_pub_.publish(gps_handler_.getGpsMarkers(map_frame_));
     }
 
-    // IMU heading yaw PriorFactor — only when robot is (near-)stationary
-    // and the heading message is within 100 ms of the keyframe timestamp.
-    auto hdg = gps_handler_.consumeHeading();
-    if (hdg.fresh)
-    {
-        static constexpr double kHdgSyncWindow = 0.1;
-        const double kf_time = odom_msg->header.stamp.toSec();
-        const double hdg_age = std::abs(hdg.stamp - kf_time);
-        if (hdg_age > kHdgSyncWindow)
-        {
-            ROS_DEBUG("[Heading] Skipped: %.3f s from keyframe (> %.3f s window)", hdg_age, kHdgSyncWindow);
-        }
-        else
-        {
-            const auto& tv = odom_msg->twist.twist.linear;
-            const double speed = std::sqrt(tv.x*tv.x + tv.y*tv.y + tv.z*tv.z);
-            const double vel_gate = gps_handler_.params().heading_velocity_gate;
-            if (vel_gate > 0.0 && speed > vel_gate)
-            {
-                ROS_DEBUG("[Heading] Skipped: speed=%.2f m/s > gate=%.2f m/s", speed, vel_gate);
-            }
-            else
-            {
-                structural = true;
-                const double noise_floor = gps_handler_.params().heading_factor_noise;
-                const double hcov = (hdg.cov > 1e-9)
-                    ? std::max(hdg.cov, noise_floor)
-                    : noise_floor;
-                auto yaw_noise = gtsam::noiseModel::Diagonal::Variances(
-                    (gtsam::Vector(6) << 1e6, 1e6, hcov, 1e6, 1e6, 1e6).finished());
-                kf_factors.add(gtsam::PriorFactor<gtsam::Pose3>(
-                    curr_idx,
-                    gtsam::Pose3(gtsam::Rot3::Rz(hdg.yaw), pose_to.translation()),
-                    yaw_noise));
-                ROS_INFO("\033[1;33m[Heading] Yaw PriorFactor at node %d yaw=%.1f° (cov=%.4f rad²) speed=%.2f m/s age=%.3f s\033[0m",
-                         curr_idx, hdg.yaw * 180.0 / M_PI, hdg.cov, speed, hdg_age);
-            }
-        }
-    }
-
     // Ground Z prior.
     if (use_ground_prior_ && ground_z_ready_)
         kf_factors.add(ZHeightFactor(curr_idx, ground_z_ref_, ground_prior_noise_));
@@ -754,6 +714,19 @@ void FastLioSamScQn::processKeyframe(const nav_msgs::OdometryConstPtr& odom_msg)
             }
             loop_added_flag_vis_ = true;
         }
+
+        // Yaw-drift diagnostic: quantify how much ISAM2 rotated this node relative to LIO.
+        // Large Δ at GPS factor nodes indicates accumulated yaw drift between constraints.
+        if (gps_result.factor_added)
+        {
+            const double lio_yaw  = pose_to.rotation().yaw() * 180.0 / M_PI;
+            const double slam_yaw = result.estimate.at<gtsam::Pose3>(curr_idx).rotation().yaw() * 180.0 / M_PI;
+            double delta = slam_yaw - lio_yaw;
+            while (delta >  180.0) delta -= 360.0;
+            while (delta < -180.0) delta += 360.0;
+            ROS_INFO("[GPS] Yaw d @node %d: LIO %.1f deg -> SLAM %.1f deg (D=%.2f deg)",
+                     curr_idx, lio_yaw, slam_yaw, delta);
+        }
     }
 }
 
@@ -778,7 +751,7 @@ void FastLioSamScQn::loopTimerFunc(const ros::TimerEvent& /*event*/)
     const int min_sep = isam_backend_.minLoopKfSep();
     if (std::abs(latest_keyframe.idx_ - closest_keyframe_idx) < min_sep)
     {
-        ROS_DEBUG_THROTTLE(5.0, "[Loop] Candidate kf %d too close (gap %d < min %d) — skipping",
+        ROS_DEBUG_THROTTLE(5.0, "[Loop] Candidate kf %d too close (gap %d < min %d) -- skipping",
                   closest_keyframe_idx,
                   std::abs(latest_keyframe.idx_ - closest_keyframe_idx), min_sep);
         return;
@@ -822,7 +795,7 @@ void FastLioSamScQn::loopTimerFunc(const ros::TimerEvent& /*event*/)
     }
     else
     {
-        ROS_WARN("[Loop] Rejected: score=%.3f (kf %d → %d)",
+        ROS_WARN("[Loop] Rejected: score=%.3f (kf %d -> %d)",
                  reg_output.score_, latest_keyframe.idx_, closest_keyframe_idx);
         isam_backend_.loops_rejected.fetch_add(1, std::memory_order_relaxed);
     }
@@ -924,7 +897,7 @@ bool FastLioSamScQn::lmRefineSrvCallback(grover_msgs::SrvInt16::Request& req,
     if (!is_initialized_)
     {
         res.success = false;
-        res.message = "SLAM not yet initialized — no graph to refine";
+        res.message = "SLAM not yet initialized -- no graph to refine";
         return true;
     }
 
@@ -964,7 +937,7 @@ bool FastLioSamScQn::lmRefineSrvCallback(grover_msgs::SrvInt16::Request& req,
     loop_added_flag_vis_ = true;
 
     res.success = true;
-    res.message = "LM refinement completed — corrected_esti and keyframes updated";
+    res.message = "LM refinement completed -- corrected_esti and keyframes updated";
     return true;
 }
 
@@ -1012,7 +985,7 @@ std::string FastLioSamScQn::saveMapPcd(const std::string& base_dir)
     const std::string yaml_path = (out_dir / "metadata.yaml").string();
 
     pcl::io::savePCDFileASCII<PointType>(pcd_path, *voxelized);
-    ROS_INFO("\033[1;32m[Save] Map saved → %s  (%zu pts)\033[0m",
+    ROS_INFO("\033[1;32m[Save] Map saved -> %s  (%zu pts)\033[0m",
              pcd_path.c_str(), voxelized->size());
 
     // Write metadata.yaml
@@ -1037,7 +1010,7 @@ std::string FastLioSamScQn::saveMapPcd(const std::string& base_dir)
             ofs << "  longitude: null\n";
         }
     }
-    ROS_INFO("\033[1;32m[Save] Metadata → %s\033[0m", yaml_path.c_str());
+    ROS_INFO("\033[1;32m[Save] Metadata -> %s\033[0m", yaml_path.c_str());
 
     // ── Session dump for offline PGO ──────────────────────────────────────────
     // 1) keyframes.csv — pose snapshots (copied under lock, written outside)
@@ -1064,7 +1037,7 @@ std::string FastLioSamScQn::saveMapPcd(const std::string& base_dir)
                     kf_csv << "," << s.pose(r, c);  // row-major in file
             kf_csv << "\n";
         }
-        ROS_INFO("\033[1;32m[Save] Keyframes → %s  (%zu rows)\033[0m",
+        ROS_INFO("\033[1;32m[Save] Keyframes -> %s  (%zu rows)\033[0m",
                  (out_dir / "keyframes.csv").c_str(), snaps.size());
     }
 
@@ -1087,7 +1060,7 @@ std::string FastLioSamScQn::saveMapPcd(const std::string& base_dir)
                 std::snprintf(name, sizeof(name), "%06d.pcd", kf.idx_);
                 pcl::io::savePCDFileBinary((clouds_dir / name).string(), kf.pcd_);
             }
-            ROS_INFO("\033[1;32m[Save] %zu keyframe clouds → %s/\033[0m",
+            ROS_INFO("\033[1;32m[Save] %zu keyframe clouds -> %s/\033[0m",
                      keyframes_.size(), clouds_dir.c_str());
         }
     }

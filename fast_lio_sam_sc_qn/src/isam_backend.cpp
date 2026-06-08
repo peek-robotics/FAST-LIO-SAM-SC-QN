@@ -83,14 +83,14 @@ bool IsamBackend::tryAddLoop(int src_idx, int dst_idx, int src_bucket, int dst_b
     while (yaw_diff_deg < -180.0) yaw_diff_deg += 360.0;
     yaw_diff_deg = std::abs(yaw_diff_deg);
 
-    ROS_INFO("[Loop] ICP yaw=%.1f° LIO yaw=%.1f° (diff=%.1f°)",
+    ROS_INFO("[Loop] ICP yaw=%.1f deg LIO yaw=%.1f deg (diff=%.1f deg)",
              icp_between.rotation().yaw() * 180.0 / M_PI,
              lio_rel_rot.yaw() * 180.0 / M_PI,
              yaw_diff_deg);
 
     if (yaw_diff_deg > p_.loop_max_yaw_diff_deg)
     {
-        ROS_WARN("[Loop] Rejected: ICP yaw disagrees with LIO by %.1f° > %.1f° gate — likely false match",
+        ROS_WARN("[Loop] Rejected: ICP yaw disagrees with LIO by %.1f deg > %.1f deg gate -- likely false match",
                  yaw_diff_deg, p_.loop_max_yaw_diff_deg);
         return false;
     }
@@ -102,7 +102,7 @@ bool IsamBackend::tryAddLoop(int src_idx, int dst_idx, int src_bucket, int dst_b
     auto v = (gtsam::Vector(6) << rv, rv, rv, tv, tv, tv).finished();
     auto loop_noise = gtsam::noiseModel::Diagonal::Variances(v);
 
-    ROS_INFO("[Loop] Factor noise: rot=%.4f rad² (%.1f° 1σ)  pos=%.3f m² (%.2f m 1σ)",
+    ROS_INFO("[Loop] Factor noise: rot=%.4f rad^2 (%.1f deg 1-sig)  pos=%.3f m^2 (%.2f m 1-sig)",
              rv, std::sqrt(rv) * 180.0 / M_PI, tv, std::sqrt(tv));
 
     {
@@ -168,7 +168,7 @@ IsamBackend::UpdateResult IsamBackend::commit(bool structural_change, bool gps_a
     }
     catch (const gtsam::IndeterminantLinearSystemException& e)
     {
-        ROS_WARN("[ISAM2] IndeterminantLinearSystem — discarding loop factor and rebuilding: %s", e.what());
+        ROS_WARN("[ISAM2] IndeterminantLinearSystem -- discarding loop factor and rebuilding: %s", e.what());
 
         // Remove the bad loop pair so the bucket can be retried later.
         if (had_loop && !loop_idx_pairs_.empty())
@@ -215,7 +215,7 @@ IsamBackend::UpdateResult IsamBackend::commit(bool structural_change, bool gps_a
         }
         catch (const gtsam::IndeterminantLinearSystemException& e2)
         {
-            ROS_ERROR("[ISAM2] Rebuild also failed: %s — resetting to empty ISAM2", e2.what());
+            ROS_ERROR("[ISAM2] Rebuild also failed: %s -- resetting to empty ISAM2", e2.what());
             isam_ = makeIsam2();
             committed_.resize(0);
         }
@@ -228,7 +228,7 @@ IsamBackend::UpdateResult IsamBackend::commit(bool structural_change, bool gps_a
     const gtsam::Values new_esti = isam_->calculateEstimate();
     if (new_esti.empty())
     {
-        ROS_ERROR_THROTTLE(2.0, "[ISAM2] calculateEstimate() returned empty — keeping stale estimate");
+        ROS_ERROR_THROTTLE(2.0, "[ISAM2] calculateEstimate() returned empty -- keeping stale estimate");
         return result;
     }
 
@@ -251,7 +251,7 @@ bool IsamBackend::runLMRefinementLocked(int passes, const std::string& tag)
     if (p_.max_lm_factors > 0 &&
         committed_.size() > static_cast<size_t>(p_.max_lm_factors))
     {
-        ROS_WARN("[%s] Skipping batch LM: %zu factors > limit %d — ISAM2 force-relinearize only",
+        ROS_WARN("[%s] Skipping batch LM: %zu factors > limit %d -- ISAM2 force-relinearize only",
                  tag.c_str(), committed_.size(), p_.max_lm_factors);
         return false;
     }
@@ -283,13 +283,13 @@ bool IsamBackend::runLMRefinementLocked(int passes, const std::string& tag)
         }
         catch (const std::exception& ex)
         {
-            ROS_WARN("[%s] LM pass %d/%d failed: %s — stopping passes",
+            ROS_WARN("[%s] LM pass %d/%d failed: %s -- stopping passes",
                      tag.c_str(), pass + 1, passes, ex.what());
             break;
         }
 
         auto lm_t1 = high_resolution_clock::now();
-        ROS_INFO("[%s] LM pass %d/%d done in %.1f ms — rebuilding ISAM2",
+        ROS_INFO("[%s] LM pass %d/%d done in %.1f ms -- rebuilding ISAM2",
                  tag.c_str(), pass + 1, passes,
                  duration_cast<microseconds>(lm_t1 - lm_t0).count() / 1e3);
         lm_t0 = lm_t1;
@@ -304,7 +304,7 @@ bool IsamBackend::runLMRefinementLocked(int passes, const std::string& tag)
         }
         catch (const gtsam::IndeterminantLinearSystemException& e)
         {
-            ROS_ERROR("[%s] ISAM2 rebuild LM pass %d/%d failed: %s — stopping passes",
+            ROS_ERROR("[%s] ISAM2 rebuild LM pass %d/%d failed: %s -- stopping passes",
                       tag.c_str(), pass + 1, passes, e.what());
             break;
         }

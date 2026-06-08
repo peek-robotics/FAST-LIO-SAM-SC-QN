@@ -56,10 +56,14 @@ struct GpsParams
     double stable_tol_pos_m    = 1.0;   ///< [m]   max XY range in position window
 
     // Heading / yaw factors
-    double heading_cov_gate      = 0.1;    ///< [rad²] max yaw cov accepted from GPS odom msg
-    double heading_noise_floor   = 0.01;   ///< [rad²] noise floor for GPS-derived yaw factor
-    double heading_factor_noise  = 0.0076; ///< [rad²] default IMU heading topic factor noise
-    double heading_velocity_gate = 0.0;    ///< [m/s]  skip heading factor if |v_linear| exceeds this; 0 = disabled
+    double heading_noise_floor   = 0.05;   ///< [rad²] noise floor for heading PriorFactor added alongside GPS factor
+
+    // Course-over-ground heading (derived from consecutive accepted GPS XY positions)
+    bool   use_cog_heading = false;
+    double cog_noise_floor = 0.05; ///< [rad²] noise floor for COG heading PriorFactor (also used as floor when propagating from GPS XY noise)
+
+    // Best-fix buffering
+    double best_fix_window = 0.0;  ///< [s] after spacing gate passes, buffer fixes for this long then commit the best (0 = off)
 
     // LM triggers
     bool lm_every_factor = false;  ///< run LM on every accepted GPS factor, not just re-entry
@@ -100,15 +104,6 @@ public:
         double lon = std::numeric_limits<double>::quiet_NaN(); ///< WGS-84 longitude [deg]
     };
 
-    /// Heading reading consumed once per keyframe.
-    struct HeadingSnapshot
-    {
-        bool   fresh = false;
-        double yaw   = 0.0;
-        double cov   = 0.0;
-        double stamp = 0.0;  ///< header.stamp of the source IMU message [s]
-    };
-
     explicit GpsHandler(const GpsParams& p);
 
     /// Read-only access to loaded parameters.
@@ -129,10 +124,6 @@ public:
     FactorResult tryAddFactor(double kf_time, int node_idx,
                               double traveled_dist, double current_z,
                               gtsam::NonlinearFactorGraph& graph_out);
-
-    // ── Continuous heading factor (IMU heading topic) ─────────────────────────
-    /// Returns and clears the latest cached heading reading.
-    HeadingSnapshot consumeHeading();
 
     // ── Visualization ─────────────────────────────────────────────────────────
     visualization_msgs::MarkerArray getGpsMarkers(const std::string& map_frame) const;
@@ -175,16 +166,29 @@ private:
     double init_lat_             = std::numeric_limits<double>::quiet_NaN();
     double init_lon_             = std::numeric_limits<double>::quiet_NaN();
 
-    // Continuous heading state (IMU heading topic)
+    // Latest cached heading from IMU heading topic
     mutable std::mutex heading_mutex_;
     double latest_heading_yaw_   = 0.0;
-    double latest_heading_cov_   = 0.0;
     double latest_heading_stamp_ = 0.0;
-    bool   latest_heading_fresh_ = false;
+
+    // Best-fix buffer
+    struct BufCandidate
+    {
+        nav_msgs::Odometry gps;
+        GpsFixTier         tier;
+        int8_t             fix_status = sensor_msgs::NavSatStatus::STATUS_FIX;
+        double             cov_trace  = 0.0;   ///< noise_x + noise_y (lower = better)
+        double             hdg_yaw    = 0.0;
+        bool               has_hdg    = false;
+    };
+    bool                      buffering_         = false;
+    double                    buffer_start_time_ = 0.0;
+    std::vector<BufCandidate> fix_buffer_;
 
     // GPS factor bookkeeping (promoted from function-static locals in original code)
     bool          first_gps_added_               = false;
     pcl::PointXYZ last_gps_point_                = {0.f, 0.f, 0.f};
+    int8_t        last_gps_fix_status_           = sensor_msgs::NavSatStatus::STATUS_NO_FIX;
     int           re_entry_skip_remaining_       = 0;
     double        last_gps_accepted_path_length_ = 0.0;
     bool          gps_reentry_pending_           = true;
@@ -210,4 +214,12 @@ private:
 
     /// Snapshot the init values and set gps_heading_received_ = true.
     void finalizeInit(double yaw, double x, double y, double z);
+
+    /// Accept a single GPS fix (all gates already passed) into the factor graph.
+    /// Updates all bookkeeping. Caller holds gps_mutex_.
+    FactorResult acceptFixIntoGraph(const nav_msgs::Odometry& gps_msg, const GpsFixTier& tier,
+                                    int8_t fix_status, int node_idx,
+                                    double traveled_dist, double current_z,
+                                    bool hdg_has, double hdg_yaw,
+                                    gtsam::NonlinearFactorGraph& graph_out);
 };
