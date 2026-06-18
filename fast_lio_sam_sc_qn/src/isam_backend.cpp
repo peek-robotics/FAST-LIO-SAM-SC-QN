@@ -95,6 +95,22 @@ bool IsamBackend::tryAddLoop(int src_idx, int dst_idx, int src_bucket, int dst_b
         return false;
     }
 
+    // Position disagreement gate: reject if ICP-derived translation differs from
+    // the LIO odometry chain by more than max_pos_diff_m.  This is the position
+    // analogue of the yaw gate — prevents loops that would pull the graph far from
+    // where GPS and odometry already agree.  Set max_pos_diff_m ≤ 0 to disable.
+    if (p_.loop_max_pos_diff_m > 0.0)
+    {
+        const gtsam::Pose3  lio_between = lio_from.between(lio_to);
+        const double pos_diff_m = (icp_between.translation() - lio_between.translation()).norm();
+        if (pos_diff_m > p_.loop_max_pos_diff_m)
+        {
+            ROS_WARN("[Loop] Rejected: ICP pos disagrees with LIO by %.2f m > %.2f m gate — likely false match",
+                     pos_diff_m, p_.loop_max_pos_diff_m);
+            return false;
+        }
+    }
+
     // Rotation variance: floor × (1 + scale × yaw_diff_deg) so the factor softens as
     // ICP-vs-LIO disagreement grows without hard-rejecting potentially valid yaw corrections.
     const double rv = p_.loop_noise_floor_rot * (1.0 + p_.loop_noise_rot_scale * yaw_diff_deg);

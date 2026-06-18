@@ -17,12 +17,14 @@ struct PosePcd
     PosePcd() {}
     PosePcd(const nav_msgs::Odometry &odom_in,
             const sensor_msgs::PointCloud2 &pcd_in,
-            const int &idx_in);
+            const int &idx_in,
+            bool input_in_lidar_frame = false);
 };
 
 inline PosePcd::PosePcd(const nav_msgs::Odometry &odom_in,
                         const sensor_msgs::PointCloud2 &pcd_in,
-                        const int &idx_in)
+                        const int &idx_in,
+                        bool input_in_lidar_frame)
 {
     tf::Quaternion q(odom_in.pose.pose.orientation.x,
                      odom_in.pose.pose.orientation.y,
@@ -38,8 +40,16 @@ inline PosePcd::PosePcd(const nav_msgs::Odometry &odom_in,
     pose_corrected_eig_ = pose_eig_;
     pcl::PointCloud<PointType> tmp_pcd;
     pcl::fromROSMsg(pcd_in, tmp_pcd);
-    pcd_ = transformPcd(tmp_pcd, pose_eig_.inverse()); // FAST-LIO publish data in world frame,
-                                                       // so save it in LiDAR frame
+    if (input_in_lidar_frame)
+    {
+        // Cloud is already in LiDAR frame — store directly.
+        pcd_ = std::move(tmp_pcd);
+    }
+    else
+    {
+        // Cloud is in world (odom) frame — invert the odometry transform to get LiDAR frame.
+        pcd_ = transformPcd(tmp_pcd, pose_eig_.inverse());
+    }
     timestamp_ = odom_in.header.stamp.toSec();
     idx_ = idx_in;
 }

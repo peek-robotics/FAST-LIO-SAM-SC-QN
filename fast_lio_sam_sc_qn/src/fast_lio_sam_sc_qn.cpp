@@ -92,6 +92,7 @@ BackendParams FastLioSamScQn::loadBackendParams(const ros::NodeHandle& nh)
     nh.param<double>("/loop_closure/noise_rot_scale",      p.loop_noise_rot_scale,    1.0);
     nh.param<double>("/loop_closure/noise_floor_pos",      p.loop_noise_floor_pos,    1.0);
     nh.param<double>("/loop_closure/max_yaw_diff_deg",     p.loop_max_yaw_diff_deg,   30.0);
+    nh.param<double>("/loop_closure/max_pos_diff_m",       p.loop_max_pos_diff_m,     5.0);
 
     // Per-axis odom noise — helper to load a 3-element XmlRpc array.
     // XmlRpc may parse YAML values as TypeInt or TypeDouble; handle both and
@@ -142,6 +143,7 @@ void FastLioSamScQn::loadParams(LoopClosureConfig& lc_config, double& loop_hz, d
     nh_.param<std::string>("/basic/robot_frame", robot_frame_,  "base_footprint");
     nh_.param<bool>("/basic/publish_tf",         publish_tf_,   true);
     nh_.param<bool>("/basic/init_from_tf",       init_from_tf_, true);
+    nh_.param<bool>("/basic/input_pcd_lidar_frame", input_pcd_lidar_frame_, false);
     nh_.param<double>("/basic/max_odom_jump_m",  max_odom_jump_m_, 3.0);
     nh_.param<double>("/basic/lio_cov_threshold",lio_cov_threshold_, 1.0);
     nh_.param<bool>("/basic/reinit_on_jump",     reinit_on_jump_, true);
@@ -352,7 +354,7 @@ void FastLioSamScQn::odomPcdCallback(const nav_msgs::OdometryConstPtr& odom_msg,
                                       const sensor_msgs::PointCloud2ConstPtr& pcd_msg)
 {
     const Eigen::Matrix4d last_odom_tf = current_frame_.pose_eig_;
-    current_frame_ = PosePcd(*odom_msg, *pcd_msg, current_keyframe_idx_);
+    current_frame_ = PosePcd(*odom_msg, *pcd_msg, current_keyframe_idx_, input_pcd_lidar_frame_);
     perf_frames_total_.fetch_add(1, std::memory_order_relaxed);
 
     if (!passLioHealthChecks(odom_msg, last_odom_tf))
@@ -576,6 +578,9 @@ void FastLioSamScQn::tryInitialize()
     const GpsHandler::InitSnapshot snap = gps_handler_.getInitSnapshot();
     init_lat_ = snap.lat;
     init_lon_ = snap.lon;
+    init_alt_ = snap.z;
+    init_x_   = snap.x;
+    init_y_   = snap.y;
     if (!std::isnan(snap.yaw))
     {
         const gtsam::Rot3 lio_rot = init_pose.rotation();
@@ -736,13 +741,27 @@ void FastLioSamScQn::processKeyframe(const nav_msgs::OdometryConstPtr& odom_msg)
 
 void FastLioSamScQn::loopTimerFunc(const ros::TimerEvent& /*event*/)
 {
-    if (!is_initialized_ || keyframes_.empty())
+    if (!is_initialized_)
         return;
 
-    auto& latest_keyframe = keyframes_.back();
-    if (latest_keyframe.processed_)
-        return;
-    latest_keyframe.processed_ = true;
+    // ── Snapshot the latest unprocessed keyframe under lock ──────────────────
+    // keyframes_ is mutated by processKeyframe() (running on spinner threads via
+    // AsyncSpinner(4)).  Taking a reference to back() and using it outside the
+    // lock is a use-after-free risk when push_back triggers reallocation.
+    // Copy the PosePcd under the lock and work on the copy; remaining index-based
+    // accesses to keyframes_[] are safe because the vector only grows (existing
+    // elements are never erased or moved once inserted).
+    PosePcd latest_keyframe;
+    {
+        std::lock_guard<std::mutex> lk(keyframes_mutex_);
+        if (keyframes_.empty())
+            return;
+        auto& back = keyframes_.back();
+        if (back.processed_)
+            return;
+        back.processed_ = true;
+        latest_keyframe = back;   // deep copy — safe after lock release
+    }
 
     const high_resolution_clock::time_point t1 = high_resolution_clock::now();
 
@@ -1003,13 +1022,29 @@ std::string FastLioSamScQn::saveMapPcd(const std::string& base_dir)
         ofs << "  description: \"GTSAM node 0 — position at SLAM initialisation\"\n";
         if (!std::isnan(init_lat_) && !std::isnan(init_lon_))
         {
-            ofs << "  latitude:  " << init_lat_ << "\n";
-            ofs << "  longitude: " << init_lon_ << "\n";
+            ofs << "  init_gps:\n";
+            ofs << "    latitude:  " << init_lat_ << "  # WGS-84 at init time\n";
+            ofs << "    longitude: " << init_lon_ << "\n";
+            ofs << "    altitude:  " << init_alt_ << "  # metres\n";
         }
         else
         {
-            ofs << "  latitude:  null  # GPS fix not available at init\n";
-            ofs << "  longitude: null\n";
+            ofs << "  init_gps:\n";
+            ofs << "    latitude:  null  # GPS fix not available at init\n";
+            ofs << "    longitude: null\n";
+            ofs << "    altitude:  null\n";
+        }
+        if (!std::isnan(init_x_) && !std::isnan(init_y_))
+        {
+            ofs << "  init_utm:\n";
+            ofs << "    description: \"UTM coordinates of GTSAM node 0 at initialisation\"\n";
+            ofs << "    x: " << init_x_ << "  # easting  [m]\n";
+            ofs << "    y: " << init_y_ << "  # northing [m]\n";
+            ofs << "    z: " << init_alt_ << "  # altitude [m]\n";
+        }
+        else
+        {
+            ofs << "  init_utm: null  # GPS position not available at init\n";
         }
     }
     ROS_INFO("\033[1;32m[Save] Metadata -> %s\033[0m", yaml_path.c_str());

@@ -69,6 +69,7 @@ private:
     bool reinit_on_jump_;
     int  reinit_skip_frames_               = 10;
     int  post_reinit_frames_remaining_     = 0;
+    bool input_pcd_lidar_frame_            = false;  // true if input_pcd is already in LiDAR frame
 
     // ── Runtime state ────────────────────────────────────────────────────────
     bool is_initialized_      = false;
@@ -115,6 +116,9 @@ private:
     bool save_map_pcd_ = false;
     double init_lat_   = std::numeric_limits<double>::quiet_NaN();
     double init_lon_   = std::numeric_limits<double>::quiet_NaN();
+    double init_alt_   = std::numeric_limits<double>::quiet_NaN();
+    double init_x_     = std::numeric_limits<double>::quiet_NaN();
+    double init_y_     = std::numeric_limits<double>::quiet_NaN();
 
     // ── Subsystems ───────────────────────────────────────────────────────────
     std::shared_ptr<LoopClosure> loop_closure_;

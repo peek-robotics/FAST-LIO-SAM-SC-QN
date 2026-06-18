@@ -51,6 +51,7 @@ struct BackendParams
     double loop_noise_rot_scale  = 1.0;   ///< scale: rot_var = floor * (1 + scale * yaw_diff_deg)
     double loop_noise_floor_pos  = 1.0;   ///< [m²] minimum position variance for loop factor
     double loop_max_yaw_diff_deg = 30.0;  ///< [deg] reject loop if ICP yaw disagrees with LIO by more than this
+    double loop_max_pos_diff_m   = 5.0;   ///< [m]  reject loop if ICP translation disagrees with LIO by more than this
 };
 
 ///
