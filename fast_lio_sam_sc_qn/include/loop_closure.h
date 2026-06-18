@@ -61,6 +61,7 @@ struct LoopClosureConfig
     double scancontext_dist_thres_ = 0.2;
     double scancontext_max_radius_ = 80.0;
     double scancontext_max_correspondence_distance_;
+    double scancontext_query_fov_deg_ = 360.0;
     NanoGICPConfig gicp_config_;
     QuatroConfig quatro_config_;
 };

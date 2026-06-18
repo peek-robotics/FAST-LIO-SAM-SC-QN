@@ -161,6 +161,8 @@ void FastLioSamScQn::loadParams(LoopClosureConfig& lc_config, double& loop_hz, d
                       lc_config.scancontext_max_radius_, 80.0);
     nh_.param<double>("/scancontext_max_correspondence_distance",
                       lc_config.scancontext_max_correspondence_distance_, 35.0);
+    nh_.param<double>("/scancontext_query_fov_deg",
+                      lc_config.scancontext_query_fov_deg_, 360.0);
     /* nano (GICP) */
     nh_.param<int>("/nano_gicp/thread_number",              gc.nano_thread_number_, 0);
     nh_.param<double>("/nano_gicp/icp_score_threshold",     gc.icp_score_thr_, 10.0);

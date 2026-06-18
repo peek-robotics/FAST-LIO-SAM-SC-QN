@@ -87,9 +87,16 @@ void LoopClosure::saveDescriptors(const std::string& out_dir) const
 int LoopClosure::fetchCandidateKeyframeIdx(const PosePcd &query_keyframe,
                                            const std::vector<PosePcd> &keyframes)
 {
-    // from ScanContext, get the loop candidate
-    std::pair<int, float> sc_detected_ = sc_manager_.detectLoopClosureIDGivenScan(query_keyframe.pcd_); // int: nearest node index,
-                                                                                                        // float: relative yaw
+    const Eigen::Vector3d query_pos = query_keyframe.pose_corrected_eig_.block<3, 1>(0, 3);
+    const Eigen::Matrix3d query_rot = query_keyframe.pose_corrected_eig_.block<3, 3>(0, 0);
+    const double query_yaw = std::atan2(query_rot(1, 0), query_rot(0, 0));
+    std::vector<Eigen::Vector3d> kf_positions;
+    kf_positions.reserve(keyframes.size());
+    for (const auto &kf : keyframes)
+        kf_positions.push_back(kf.pose_corrected_eig_.block<3, 1>(0, 3));
+
+    std::pair<int, float> sc_detected_ = sc_manager_.detectLoopClosureIDGivenScan(
+        query_keyframe.pcd_, query_pos, query_yaw, kf_positions, config_.scancontext_query_fov_deg_);
     const double sc_dist = sc_manager_.getLastSCDist();
     int candidate_keyframe_idx = sc_detected_.first;
     if (candidate_keyframe_idx < 0)
