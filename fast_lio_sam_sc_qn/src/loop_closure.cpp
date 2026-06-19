@@ -91,12 +91,18 @@ int LoopClosure::fetchCandidateKeyframeIdx(const PosePcd &query_keyframe,
     const Eigen::Matrix3d query_rot = query_keyframe.pose_corrected_eig_.block<3, 3>(0, 0);
     const double query_yaw = std::atan2(query_rot(1, 0), query_rot(0, 0));
     std::vector<Eigen::Vector3d> kf_positions;
+    std::vector<double> kf_yaws;
     kf_positions.reserve(keyframes.size());
+    kf_yaws.reserve(keyframes.size());
     for (const auto &kf : keyframes)
+    {
         kf_positions.push_back(kf.pose_corrected_eig_.block<3, 1>(0, 3));
+        const Eigen::Matrix3d rot = kf.pose_corrected_eig_.block<3, 3>(0, 0);
+        kf_yaws.push_back(std::atan2(rot(1, 0), rot(0, 0)));
+    }
 
     std::pair<int, float> sc_detected_ = sc_manager_.detectLoopClosureIDGivenScan(
-        query_keyframe.pcd_, query_pos, query_yaw, kf_positions, config_.scancontext_query_fov_deg_);
+        query_keyframe.pcd_, query_pos, query_yaw, kf_positions, kf_yaws, config_.scancontext_query_fov_deg_);
     const double sc_dist = sc_manager_.getLastSCDist();
     int candidate_keyframe_idx = sc_detected_.first;
     if (candidate_keyframe_idx < 0)
