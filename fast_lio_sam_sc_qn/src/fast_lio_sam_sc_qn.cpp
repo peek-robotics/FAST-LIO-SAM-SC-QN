@@ -219,10 +219,10 @@ void FastLioSamScQn::setupRos(double loop_hz, double vis_hz,
 
     // Output directory: param override > /data/slam (if /data exists) > /tmp/slam
     std::string save_base;
+    std::error_code ec;
     nh_.param<std::string>("/result/save_dir", save_base, "");
     if (save_base.empty())
     {
-        std::error_code ec;
         if (fs::is_directory("/data", ec))
             save_base = "/data/slam";
         else
