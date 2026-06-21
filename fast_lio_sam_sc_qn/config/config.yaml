@@ -25,6 +25,8 @@ nano_gicp:                                    # all values are from Nano-GICP of
   ransac:
     max_iter: 5
     outlier_rejection_threshold: 1.0
+  min_overlap_ratio: 0.15                     # 0 = disabled. Min fraction of source points that must overlap target after ICP (0.15 = 15%)
+  overlap_distance: 0.5                       # [m] NN distance below which a source point counts as overlapping the target
 
 quatro:                                       # all values are from Quatro official github
   enable: true                                # whether or not to use quatro, if false -> FAST-LIO-SAM-N (Nano-GICP only)

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <pcl/kdtree/kdtree_flann.h>
 
 LoopClosure::LoopClosure(const LoopClosureConfig &config)
 {
@@ -199,13 +200,69 @@ RegistrationOutput LoopClosure::icpAlignment(const pcl::PointCloud<PointType> &s
 
     // handle results
     reg_output.score_ = nano_gicp_.getFitnessScore();
-    // if matchness score is lower than threshold, (lower is better)
-    if (nano_gicp_.hasConverged() && reg_output.score_ < config_.gicp_config_.icp_score_thr_)
+
+    if (!nano_gicp_.hasConverged())
+        return reg_output;
+
+    const auto& ol_cfg = config_.gicp_config_;
+    const bool use_overlap = (ol_cfg.min_overlap_ratio_ > 0.0);
+
+    // ── Compute overlap ratio (when gate is enabled) ────────────────────
+    if (use_overlap && !aligned_.empty())
     {
-        reg_output.is_valid_ = true;
-        reg_output.is_converged_ = true;
-        reg_output.pose_between_eig_ = nano_gicp_.getFinalTransformation().cast<double>();
+        pcl::KdTreeFLANN<PointType> kdtree;
+        kdtree.setInputCloud(dst_cloud);
+        std::vector<int>   nn_idx(1);
+        std::vector<float> nn_dist(1);
+        const double dist_sq = ol_cfg.overlap_dist_ * ol_cfg.overlap_dist_;
+        size_t overlap_pts = 0, valid_pts = 0;
+        for (const auto& pt : aligned_)
+        {
+            if (!std::isfinite(pt.x)) continue;
+            ++valid_pts;
+            kdtree.nearestKSearch(pt, 1, nn_idx, nn_dist);
+            if (nn_dist[0] < dist_sq) ++overlap_pts;
+        }
+        reg_output.overlap_ratio_ = (valid_pts > 0)
+            ? static_cast<double>(overlap_pts) / valid_pts : 0.0;
     }
+
+    // ── Acceptance gate ─────────────────────────────────────────────────
+    if (use_overlap)
+    {
+        // Hard floor: reject if too little of the scene actually overlaps.
+        if (reg_output.overlap_ratio_ < ol_cfg.min_overlap_ratio_)
+        {
+            ROS_DEBUG("[ICP] Overlap floor: %.1f%% < %.1f%%  (score=%.4f) -- rejected",
+                      100.0 * reg_output.overlap_ratio_,
+                      100.0 * ol_cfg.min_overlap_ratio_,
+                      reg_output.score_);
+            return reg_output;
+        }
+        // Normalised score: divide by overlap ratio so tight partial matches can pass.
+        // Floor denominator at 5 % to prevent numerical blow-up on tiny overlaps
+        // (which are already caught by the hard floor above when min_overlap_ratio_ ≥ 0.05).
+        const double denom = std::max(reg_output.overlap_ratio_, 0.05);
+        const double norm_score = reg_output.score_ / denom;
+        if (norm_score >= ol_cfg.icp_score_thr_)
+        {
+            ROS_DEBUG("[ICP] Norm-score gate: %.4f / %.1f%% = %.4f >= %.3f -- rejected",
+                      reg_output.score_, 100.0 * reg_output.overlap_ratio_,
+                      norm_score, ol_cfg.icp_score_thr_);
+            return reg_output;
+        }
+    }
+    else
+    {
+        // Legacy: when overlap gate is disabled, use raw score threshold.
+        if (reg_output.score_ >= ol_cfg.icp_score_thr_)
+            return reg_output;
+    }
+    // ─────────────────────────────────────────────────────────────────────
+
+    reg_output.is_valid_ = true;
+    reg_output.is_converged_ = true;
+    reg_output.pose_between_eig_ = nano_gicp_.getFinalTransformation().cast<double>();
     return reg_output;
 }
 

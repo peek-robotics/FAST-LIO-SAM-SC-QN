@@ -36,6 +36,9 @@ struct NanoGICPConfig
     double transformation_epsilon_ = 0.01;
     double euclidean_fitness_epsilon_ = 0.01;
     double ransac_outlier_rejection_threshold_ = 1.0;
+    double min_overlap_ratio_ = 0.0;   ///< 0 = disabled.  Minimum fraction of source points
+                                        ///< that must have a target neighbour within overlap_dist_.
+    double overlap_dist_     = 0.5;    ///< [m]  NN distance below which a point counts as overlapping.
 };
 
 struct QuatroConfig
@@ -71,6 +74,7 @@ struct RegistrationOutput
     bool is_valid_ = false;
     bool is_converged_ = false;
     double score_ = std::numeric_limits<double>::max();
+    double overlap_ratio_ = 0.0;              ///< fraction of source points overlapping target
     Eigen::Matrix4d pose_between_eig_ = Eigen::Matrix4d::Identity();
 };
 

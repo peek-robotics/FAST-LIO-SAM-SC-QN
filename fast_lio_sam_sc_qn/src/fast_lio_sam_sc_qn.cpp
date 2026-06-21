@@ -175,6 +175,8 @@ void FastLioSamScQn::loadParams(LoopClosureConfig& lc_config, double& loop_hz, d
     nh_.param<double>("/nano_gicp/euclidean_fitness_epsilon",gc.euclidean_fitness_epsilon_, 0.01);
     nh_.param<int>("/nano_gicp/ransac/max_iter",            gc.nano_ransac_max_iter_, 5);
     nh_.param<double>("/nano_gicp/ransac/outlier_rejection_threshold", gc.ransac_outlier_rejection_threshold_, 1.0);
+    nh_.param<double>("/nano_gicp/min_overlap_ratio",  gc.min_overlap_ratio_,  0.0);
+    nh_.param<double>("/nano_gicp/overlap_distance",   gc.overlap_dist_,       0.5);
     /* quatro */
     nh_.param<bool>("/quatro/enable",               lc_config.enable_quatro_,          false);
     nh_.param<bool>("/quatro/optimize_matching",    qc.use_optimized_matching_,         true);
@@ -214,7 +216,20 @@ void FastLioSamScQn::setupRos(double loop_hz, double vis_hz,
 {
     odom_path_.header.frame_id      = map_frame_;
     corrected_path_.header.frame_id = map_frame_;
-    package_path_ = ros::package::getPath("fast_lio_sam_sc_qn");
+
+    // Output directory: param override > /data/slam (if /data exists) > /tmp/slam
+    std::string save_base;
+    nh_.param<std::string>("/result/save_dir", save_base, "");
+    if (save_base.empty())
+    {
+        std::error_code ec;
+        if (fs::is_directory("/data", ec))
+            save_base = "/data/slam";
+        else
+            save_base = "/tmp/slam";
+    }
+    fs::create_directories(save_base, ec);
+    package_path_ = save_base;
 
     /* topic names */
     std::string t_input_odom, t_input_pcd, t_save_dir;
@@ -791,8 +806,9 @@ void FastLioSamScQn::loopTimerFunc(const ros::TimerEvent& /*event*/)
 
     if (reg_output.is_valid_)
     {
-        ROS_INFO("\033[1;32mLoop closure accepted. Score: %.3f (kf %d -> %d, gap %d)\033[0m",
-                 reg_output.score_, latest_keyframe.idx_, closest_keyframe_idx,
+        ROS_INFO("\033[1;32mLoop closure accepted. Score: %.3f  Overlap: %.0f%% (kf %d -> %d, gap %d)\033[0m",
+                 reg_output.score_, 100.0 * reg_output.overlap_ratio_,
+                 latest_keyframe.idx_, closest_keyframe_idx,
                  std::abs(latest_keyframe.idx_ - closest_keyframe_idx));
 
         const bool accepted = isam_backend_.tryAddLoop(
@@ -816,8 +832,9 @@ void FastLioSamScQn::loopTimerFunc(const ros::TimerEvent& /*event*/)
     }
     else
     {
-        ROS_WARN("[Loop] Rejected: score=%.3f (kf %d -> %d)",
-                 reg_output.score_, latest_keyframe.idx_, closest_keyframe_idx);
+        ROS_WARN("[Loop] Rejected: score=%.3f  overlap=%.0f%% (kf %d -> %d)",
+                 reg_output.score_, 100.0 * reg_output.overlap_ratio_,
+                 latest_keyframe.idx_, closest_keyframe_idx);
         isam_backend_.loops_rejected.fetch_add(1, std::memory_order_relaxed);
     }
 
