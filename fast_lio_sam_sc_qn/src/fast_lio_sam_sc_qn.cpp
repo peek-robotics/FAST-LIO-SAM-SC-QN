@@ -3,6 +3,8 @@
 #include <iomanip>
 #include <sstream>
 
+#include <robot_localization/ToLL.h>
+
 // ── Constructor ────────────────────────────────────────────────────────────────
 
 FastLioSamScQn::FastLioSamScQn(const ros::NodeHandle& n_private)
@@ -287,6 +289,11 @@ void FastLioSamScQn::setupRos(double loop_hz, double vis_hz,
     save_map_srv_ = nh_.advertiseService("save_map",
                                           &FastLioSamScQn::saveMapSrvCallback, this);
     ROS_INFO("[SLAM] Save-map service ready at %s/save_map", nh_.getNamespace().c_str());
+
+    // /toLL client (robot_localization) — used at save time to convert the
+    // map origin (0,0,0) to WGS-84 lat/lon/alt for metadata. Created here so
+    // it persists; the service need not be up at startup.
+    to_ll_client_ = nh_.serviceClient<robot_localization::ToLL>("/toLL");
 
     sub_gps_ = nh_.subscribe(gps_topic, 200, &GpsHandler::onGpsOdom, &gps_handler_,
                               ros::TransportHints().tcpNoDelay());
@@ -1036,9 +1043,52 @@ std::string FastLioSamScQn::saveMapPcd(const std::string& base_dir)
         ofs << "voxel_resolution: " << voxel_res_ << "\n";
         ofs << "keyframes: " << keyframes_.size() << "\n";
         ofs << "origin:\n";
-        ofs << "  description: \"GTSAM node 0 — position at SLAM initialisation\"\n";
-        if (!std::isnan(init_lat_) && !std::isnan(init_lon_))
+
+        // Prefer converting the map origin (0,0,0) to WGS-84 via the /toLL
+        // service (robot_localization NavSatTransform), which reflects the
+        // live map↔world transform. Fall back to the GTSAM node 0 GPS fix
+        // captured at SLAM init time if the service is unavailable.
+        bool got_gps_from_toll = false;
+        double gps_lat = std::numeric_limits<double>::quiet_NaN();
+        double gps_lon = std::numeric_limits<double>::quiet_NaN();
+        double gps_alt = std::numeric_limits<double>::quiet_NaN();
+
+        if (to_ll_client_.exists())
         {
+            robot_localization::ToLL toll_req;
+            toll_req.request.map_point.x = 0.0;
+            toll_req.request.map_point.y = 0.0;
+            toll_req.request.map_point.z = 0.0;
+            if (to_ll_client_.call(toll_req))
+            {
+                gps_lat = toll_req.response.ll_point.latitude;
+                gps_lon = toll_req.response.ll_point.longitude;
+                gps_alt = toll_req.response.ll_point.altitude;
+                got_gps_from_toll = true;
+                ROS_INFO("[Save] Origin GPS from /toLL(0,0,0): lat=%.9f lon=%.9f alt=%.3f",
+                         gps_lat, gps_lon, gps_alt);
+            }
+            else
+            {
+                ROS_WARN("[Save] /toLL service call failed; falling back to GTSAM node 0 position.");
+            }
+        }
+        else
+        {
+            ROS_WARN("[Save] /toLL service not advertised; falling back to GTSAM node 0 position.");
+        }
+
+        if (got_gps_from_toll)
+        {
+            ofs << "  description: \"Map origin (0,0,0) converted to WGS-84 via /toLL service\"\n";
+            ofs << "  init_gps:\n";
+            ofs << "    latitude:  " << gps_lat << "  # WGS-84 of map origin via /toLL\n";
+            ofs << "    longitude: " << gps_lon << "\n";
+            ofs << "    altitude:  " << gps_alt << "  # metres\n";
+        }
+        else if (!std::isnan(init_lat_) && !std::isnan(init_lon_))
+        {
+            ofs << "  description: \"GTSAM node 0 — position at SLAM initialisation\"\n";
             ofs << "  init_gps:\n";
             ofs << "    latitude:  " << init_lat_ << "  # WGS-84 at init time\n";
             ofs << "    longitude: " << init_lon_ << "\n";
@@ -1046,6 +1096,7 @@ std::string FastLioSamScQn::saveMapPcd(const std::string& base_dir)
         }
         else
         {
+            ofs << "  description: \"GTSAM node 0 — position at SLAM initialisation\"\n";
             ofs << "  init_gps:\n";
             ofs << "    latitude:  null  # GPS fix not available at init\n";
             ofs << "    longitude: null\n";

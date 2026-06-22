@@ -139,6 +139,7 @@ private:
 
     ros::Subscriber sub_save_flag_, sub_gps_, sub_gps_fix_, sub_heading_, sub_lio_diag_;
     ros::ServiceServer lm_refine_srv_, save_map_srv_;
+    ros::ServiceClient to_ll_client_;
     ros::Timer loop_timer_, vis_timer_;
 
     std::shared_ptr<message_filters::Synchronizer<odom_pcd_sync_pol>> sub_odom_pcd_sync_;

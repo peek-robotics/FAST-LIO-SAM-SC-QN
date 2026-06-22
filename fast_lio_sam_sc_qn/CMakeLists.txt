@@ -31,6 +31,8 @@ find_package(catkin REQUIRED COMPONENTS
   pcl_conversions
   message_filters
   grover_msgs
+  robot_localization
+  geographic_msgs
   nano_gicp
   quatro
   voxel_slam
