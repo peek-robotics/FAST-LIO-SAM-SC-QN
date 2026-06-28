@@ -33,7 +33,6 @@
   <build_depend>nano_gicp</build_depend>
   <build_depend>quatro</build_depend>
   <build_depend>voxel_slam</build_depend>
-  <build_depend>livox_ros_driver</build_depend>
 
   <run_depend>roscpp</run_depend>
   <run_depend>roslib</run_depend>
@@ -51,7 +50,6 @@
   <run_depend>nano_gicp</run_depend>
   <run_depend>quatro</run_depend>
   <run_depend>voxel_slam</run_depend>
-  <run_depend>livox_ros_driver</run_depend>
   <export>
   </export>
 </package>
