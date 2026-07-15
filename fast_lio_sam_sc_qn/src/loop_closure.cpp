@@ -148,23 +148,23 @@ PcdPair LoopClosure::setSrcAndDstCloud(const std::vector<PosePcd> &keyframes,
         {
             if (i >= 0 && i < static_cast<int>(keyframes.size() - 1))
             {
-                src_accum += transformPcd(keyframes[i].pcd_, keyframes[i].pose_corrected_eig_);
+                src_accum += transformPcd(keyframes[i].pcd_, keyframes[i].pose_corrected_eig_ * render_extrinsic_);
             }
         }
         for (int i = dst_idx - submap_range; i < dst_idx + submap_range + 1; ++i)
         {
             if (i >= 0 && i < static_cast<int>(keyframes.size() - 1))
             {
-                dst_accum += transformPcd(keyframes[i].pcd_, keyframes[i].pose_corrected_eig_);
+                dst_accum += transformPcd(keyframes[i].pcd_, keyframes[i].pose_corrected_eig_ * render_extrinsic_);
             }
         }
     }
     else
     {
-        src_accum = transformPcd(keyframes[src_idx].pcd_, keyframes[src_idx].pose_corrected_eig_);
+        src_accum = transformPcd(keyframes[src_idx].pcd_, keyframes[src_idx].pose_corrected_eig_ * render_extrinsic_);
         if (enable_quatro)
         {
-            dst_accum = transformPcd(keyframes[dst_idx].pcd_, keyframes[dst_idx].pose_corrected_eig_);
+            dst_accum = transformPcd(keyframes[dst_idx].pcd_, keyframes[dst_idx].pose_corrected_eig_ * render_extrinsic_);
         }
         else
         {
@@ -174,7 +174,7 @@ PcdPair LoopClosure::setSrcAndDstCloud(const std::vector<PosePcd> &keyframes,
             {
                 if (i >= 0 && i < static_cast<int>(keyframes.size() - 1))
                 {
-                    dst_accum += transformPcd(keyframes[i].pcd_, keyframes[i].pose_corrected_eig_);
+                    dst_accum += transformPcd(keyframes[i].pcd_, keyframes[i].pose_corrected_eig_ * render_extrinsic_);
                 }
             }
         }

@@ -88,9 +88,12 @@ public:
                    int first_key);
 
     // ── Factor staging: odom-callback thread only, no lock needed ─────────────
+    /// @param bridge  first keyframe after a LIO reinit: loosen position (untracked outage gap)
+    ///                but keep rotation tight — LIO/IMU yaw survives the reset, so loosening it
+    ///                would leave post-reset yaw to the laggy GPS heading alone.
     void stageOdomFactor(int prev_key, int curr_key,
                          const gtsam::Pose3& prev_pose, const gtsam::Pose3& curr_pose,
-                         bool is_degenerate);
+                         bool is_degenerate, bool bridge = false);
     void stageFactors(const gtsam::NonlinearFactorGraph& factors);
     void stageInitValue(int key, const gtsam::Pose3& pose);
 

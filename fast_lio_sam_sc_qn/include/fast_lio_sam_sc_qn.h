@@ -69,7 +69,16 @@ private:
     bool reinit_on_jump_;
     int  reinit_skip_frames_               = 10;
     int  post_reinit_frames_remaining_     = 0;
+    int  degrade_accept_max_               = 8;      ///< accept voxel_slam degrade_state <= this (downweighted); drop above. 8=High, drop Reset(16)
+    bool bridge_after_reinit_              = false;  ///< first keyframe after a reinit: loosen its odom factor
     bool input_pcd_lidar_frame_            = false;  // true if input_pcd is already in LiDAR frame
+    // Static robot_frame(base_footprint) -> lidar_frame extrinsic. voxel_slam odometry is in the
+    // LiDAR frame, but the graph node/GPS/output frame is base_footprint. When clouds are stored
+    // in the LiDAR frame we compose this at render time so map points land at their true position
+    // (fixes the heading-dependent "doubled trunks"). The node pose itself stays base_footprint.
+    std::string     lidar_frame_           = "livox_frame";
+    Eigen::Matrix4d T_base_lidar_          = Eigen::Matrix4d::Identity();
+    bool            lidar_extrinsic_ready_ = false;
 
     // ── Runtime state ────────────────────────────────────────────────────────
     bool is_initialized_      = false;
@@ -102,6 +111,7 @@ private:
 
     // ── Init ─────────────────────────────────────────────────────────────────
     double init_prior_noise_z_ = 1.0;
+    double init_prior_noise_yaw_unknown_ = 1.0;  ///< [rad^2] loose yaw prior when no GPS/heading yaw at init
     Eigen::Matrix4d tf_at_heading_pose_ = Eigen::Matrix4d::Identity();
     bool tf_at_heading_valid_  = false;
     bool heading_tf_captured_  = false;
@@ -202,6 +212,12 @@ private:
     void updateOdomsAndPaths(const PosePcd& pose_pcd_in);
     bool checkIfKeyframe(const PosePcd& a, const PosePcd& b) const;
     void cloudSparsifyThread();
+
+    /// Lazily look up + cache the static robot_frame_->lidar_frame_ transform (idempotent).
+    void ensureLidarExtrinsic(double wait_s, bool verbose);
+    /// Pose to transform a stored keyframe cloud into the map: node pose, with the base->lidar
+    /// extrinsic composed when clouds are in the LiDAR frame.
+    Eigen::Matrix4d renderPose(const Eigen::Matrix4d& node_pose) const;
 
     // ── Save map helpers ──────────────────────────────────────────────────────
     /// Build a timestamped subdirectory under base_dir, write cloud.pcd and

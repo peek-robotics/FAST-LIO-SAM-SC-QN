@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include <gtsam/linear/NoiseModel.h>  // noiseModel::Robust + mEstimator kernels (#2)
+
 // ── Construction ───────────────────────────────────────────────────────────────
 
 GpsHandler::GpsHandler(const GpsParams& p)
@@ -51,7 +53,9 @@ void GpsHandler::onNavSatFix(const sensor_msgs::NavSatFixConstPtr& msg)
     latest_fix_status_.store(msg->status.status);
     {
         std::lock_guard<std::mutex> lk(fix_mutex_);
-        fix_queue_.push_back(*msg);
+        sensor_msgs::NavSatFix f = *msg;
+        f.header.stamp += ros::Duration(p_.time_offset);  // #6 keep fix time consistent with GPS odom
+        fix_queue_.push_back(std::move(f));
     }
     // Cache raw WGS-84 lat/lon for metadata export.
     // Protected by gps_mutex_ to avoid a separate lock.
@@ -68,7 +72,9 @@ void GpsHandler::onGpsOdom(const nav_msgs::OdometryConstPtr& msg)
         latest_gps_x_     = gx = msg->pose.pose.position.x;
         latest_gps_y_     = gy = msg->pose.pose.position.y;
         latest_gps_z_     = gz = msg->pose.pose.position.z;
-        gps_queue_.push_back(*msg);
+        nav_msgs::Odometry m = *msg;
+        m.header.stamp += ros::Duration(p_.time_offset);  // #6 align GPS stamp to the LIO clock
+        gps_queue_.push_back(std::move(m));
         gps_first_received_ = true;
     }
 
@@ -294,10 +300,12 @@ const GpsFixTier* GpsHandler::resolveFixTier(double msg_time)
 
 GpsHandler::FactorResult GpsHandler::tryAddFactor(
     double kf_time, int node_idx,
-    double traveled_dist, double current_z,
+    double traveled_dist,
+    const Eigen::Matrix4d& node_pose_corrected,
     gtsam::NonlinearFactorGraph& graph_out)
 {
     FactorResult result;
+    const double current_z = node_pose_corrected(2, 3);
 
     std::lock_guard<std::mutex> lk(gps_mutex_);
     if (gps_queue_.empty() && !buffering_)
@@ -452,8 +460,35 @@ GpsHandler::FactorResult GpsHandler::tryAddFactor(
         }
 
         // Immediate accept (buffering disabled).
-        return acceptFixIntoGraph(gps_msg, *tier, fix_status,
+        // #4 Temporal interpolation: gps_msg was just popped, so gps_queue_.front() is the
+        // next fix. If [gps_msg, next] brackets the keyframe time, linearly interpolate the
+        // position + diagonal covariance to kf_time. This removes the up-to-±half-GPS-period
+        // offset between the fix stamp and the keyframe stamp — a heading-dependent bias (not
+        // random noise), which is why inflating covariance can't fix it. Falls back to the raw
+        // fix when there is no forward bracket within max_interp_dt.
+        nav_msgs::Odometry accept_msg = gps_msg;
+        if (p_.interpolate && !gps_queue_.empty())
+        {
+            const double t0 = gps_msg.header.stamp.toSec();
+            const double t1 = gps_queue_.front().header.stamp.toSec();
+            if (t0 <= kf_time && kf_time <= t1 && (t1 - t0) > 1e-6 && (t1 - t0) <= p_.max_interp_dt)
+            {
+                const nav_msgs::Odometry& nxt = gps_queue_.front();
+                const double a = (kf_time - t0) / (t1 - t0);
+                auto& P = accept_msg.pose.pose.position;
+                P.x += a * (nxt.pose.pose.position.x - P.x);
+                P.y += a * (nxt.pose.pose.position.y - P.y);
+                P.z += a * (nxt.pose.pose.position.z - P.z);
+                auto& C = accept_msg.pose.covariance;
+                C[0]  += a * (nxt.pose.covariance[0]  - C[0]);
+                C[7]  += a * (nxt.pose.covariance[7]  - C[7]);
+                C[14] += a * (nxt.pose.covariance[14] - C[14]);
+                ROS_DEBUG("[GPS] Interpolated fix to keyframe: a=%.2f over dt=%.3f s", a, t1 - t0);
+            }
+        }
+        return acceptFixIntoGraph(accept_msg, *tier, fix_status,
                                   node_idx, traveled_dist, current_z,
+                                  node_pose_corrected,
                                   hdg_has, hdg_yaw, graph_out);
     }
 
@@ -493,6 +528,7 @@ GpsHandler::FactorResult GpsHandler::tryAddFactor(
 
             result = acceptFixIntoGraph(best.gps, best.tier, best.fix_status,
                                         node_idx, traveled_dist, current_z,
+                                        node_pose_corrected,
                                         hdg_has, hdg_yaw, graph_out);
         }
         else
@@ -505,11 +541,38 @@ GpsHandler::FactorResult GpsHandler::tryAddFactor(
     return result;
 }
 
+// ── makeGpsNoise (#2 robust kernel) ───────────────────────────────────────────
+
+gtsam::noiseModel::Base::shared_ptr GpsHandler::makeGpsNoise(const gtsam::Vector3& var) const
+{
+    const gtsam::noiseModel::Base::shared_ptr base =
+        gtsam::noiseModel::Diagonal::Variances(var);
+    if (p_.robust_kernel.empty() || p_.robust_kernel == "none")
+        return base;
+
+    namespace mE = gtsam::noiseModel::mEstimator;
+    mE::Base::shared_ptr m;
+    const double k = p_.robust_thresh;
+    if      (p_.robust_kernel == "huber")  m = mE::Huber::Create(k);
+    else if (p_.robust_kernel == "cauchy") m = mE::Cauchy::Create(k);
+    else if (p_.robust_kernel == "gm")     m = mE::GemanMcClure::Create(k);
+    else if (p_.robust_kernel == "dcs")    m = mE::DCS::Create(k);
+    else if (p_.robust_kernel == "tukey")  m = mE::Tukey::Create(k);
+    else
+    {
+        ROS_WARN_ONCE("[GPS] Unknown robust_kernel '%s' -- using plain Gaussian noise",
+                      p_.robust_kernel.c_str());
+        return base;
+    }
+    return gtsam::noiseModel::Robust::Create(m, base);
+}
+
 // ── acceptFixIntoGraph ────────────────────────────────────────────────────────
 
 GpsHandler::FactorResult GpsHandler::acceptFixIntoGraph(
     const nav_msgs::Odometry& gps_msg, const GpsFixTier& tier, int8_t fix_status,
     int node_idx, double traveled_dist, double current_z,
+    const Eigen::Matrix4d& node_pose_corrected,
     bool hdg_has, double hdg_yaw,
     gtsam::NonlinearFactorGraph& graph_out)
 {
@@ -581,9 +644,25 @@ GpsHandler::FactorResult GpsHandler::acceptFixIntoGraph(
     const gtsam::Vector3 gps_noise_vec(std::max(noise_x * cov_scale, noise_floor),
                                        std::max(noise_y * cov_scale, noise_floor),
                                        std::max(noise_z * cov_scale, noise_floor));
+    // #2 robust kernel + #7 lever arm. Apply the lever arm as a single pre-correction of
+    // the GPS measurement: corrected = gps - R_node * arm.  A plain GPSFactor on
+    // (corrected) is then equivalent to  pose.t == gps - R_node*arm  i.e. the
+    // GPSArmFactor constraint  pose.t + R*arm == gps .  Only uses the current node yaw,
+    // so the linearization matches the prior custom factor for well-converged rotations.
+    float eff_x = gps_x, eff_y = gps_y, eff_z = gps_z;
+    if (p_.lever_arm.squaredNorm() > 1e-12)
+    {
+        const Eigen::Matrix3d R = node_pose_corrected.block<3, 3>(0, 0);
+        const Eigen::Vector3d arm = p_.lever_arm;
+        const Eigen::Vector3d world_arm = R * arm;
+        eff_x = gps_x - static_cast<float>(world_arm.x());
+        eff_y = gps_y - static_cast<float>(world_arm.y());
+        eff_z = gps_z - static_cast<float>(world_arm.z());
+    }
+    const gtsam::noiseModel::Base::shared_ptr gps_noise = makeGpsNoise(gps_noise_vec);
     graph_out.add(gtsam::GPSFactor(node_idx,
-                                   gtsam::Point3(gps_x, gps_y, gps_z),
-                                   gtsam::noiseModel::Diagonal::Variances(gps_noise_vec)));
+                                   gtsam::Point3(eff_x, eff_y, eff_z),
+                                   gps_noise));
 
     gps_constraint_points_.push_back(pcl::PointXYZ(gps_x, gps_y, gps_z));
     gps_constraint_noises_.push_back(Eigen::Vector3f(static_cast<float>(gps_noise_vec[0]),

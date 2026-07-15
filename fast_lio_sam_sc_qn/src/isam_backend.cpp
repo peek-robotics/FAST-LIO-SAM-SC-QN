@@ -36,10 +36,16 @@ void IsamBackend::initGraph(const gtsam::Pose3& init_pose,
 
 void IsamBackend::stageOdomFactor(int prev_key, int curr_key,
                                    const gtsam::Pose3& prev_pose, const gtsam::Pose3& curr_pose,
-                                   bool is_degenerate)
+                                   bool is_degenerate, bool bridge)
 {
-    const auto& rot = is_degenerate ? p_.odom_noise_rot_degen : p_.odom_noise_rot;
-    const auto& pos = is_degenerate ? p_.odom_noise_pos_degen : p_.odom_noise_pos;
+    // Bridge (first keyframe after a LIO reinit): keep rotation TIGHT (LIO/IMU yaw survives the
+    // reset) but loosen position, since the translation during the outage is untracked. Loosening
+    // rotation here would make post-reset yaw depend solely on the laggy GPS heading -> "yaw off,
+    // slowly corrects". Degenerate (non-bridge) loosens both.
+    const bool loose_rot = is_degenerate && !bridge;
+    const bool loose_pos = is_degenerate || bridge;
+    const auto& rot = loose_rot ? p_.odom_noise_rot_degen : p_.odom_noise_rot;
+    const auto& pos = loose_pos ? p_.odom_noise_pos_degen : p_.odom_noise_pos;
     auto v = (gtsam::Vector(6) << rot[0], rot[1], rot[2], pos[0], pos[1], pos[2]).finished();
     auto odom_noise = gtsam::noiseModel::Diagonal::Variances(v);
     staged_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(

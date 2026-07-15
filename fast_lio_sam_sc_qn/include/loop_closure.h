@@ -90,10 +90,20 @@ private:
     pcl::PointCloud<PointType> coarse_aligned_;
     pcl::PointCloud<PointType> aligned_;
     LoopClosureConfig config_;
+    /// Static node(base_footprint)->cloud(lidar) extrinsic, composed when transforming a stored
+    /// LiDAR-frame keyframe cloud by its base-frame node pose (identity = clouds already share the
+    /// node frame). Mirrors renderPose() in the main node so loop-closure submaps land at the true
+    /// map position instead of being lever-shifted per heading. See setRenderExtrinsic().
+    Eigen::Matrix4d render_extrinsic_ = Eigen::Matrix4d::Identity();
 
 public:
     explicit LoopClosure(const LoopClosureConfig &config);
     ~LoopClosure();
+
+    /// Set the node->cloud extrinsic used when placing stored LiDAR-frame keyframe clouds by their
+    /// base-frame node poses. Pass base<-lidar (T_base_lidar) when input_pcd is in the LiDAR frame;
+    /// leave unset (identity) when clouds are already in the node frame.
+    void setRenderExtrinsic(const Eigen::Matrix4d &T) { render_extrinsic_ = T; }
     void updateScancontext(pcl::PointCloud<PointType> cloud);
     int fetchCandidateKeyframeIdx(const PosePcd &query_keyframe,
                                   const std::vector<PosePcd> &keyframes);

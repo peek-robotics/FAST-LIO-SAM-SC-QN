@@ -2,6 +2,9 @@ basic:
   map_frame: "map"                            # publish frame
   loop_update_hz: 2.0                         # Loop detection Hz
   vis_hz: 1.0                                 # visualize Hz
+  degrade_accept_max: 4                       # accept voxel_slam degrade_state <= this with loosened odom
+                                              # noise (Ok=1,Low=2,Medium=4,High=8,Reset=16). Drop only Reset.
+                                              # Lower (e.g. 4) to be stricter about what enters the graph.
 
 keyframe:
   keyframe_threshold: 1.5                     # unit [meter] every this distance, generate keyframe
@@ -54,3 +57,16 @@ gps:
   cov_threshold: 25.0                        # [m^2] GPS factor added only when GPS noise_x AND noise_y < this value
                                              # Also used as the LiDAR pose-covariance threshold: GPS only injected when SLAM uncertainty exceeds this
   use_elevation: true                        # If false, ignores GPS z and uses current LiDAR z with noise_z=0.01 instead
+
+  # ── Robust kernel on the GPS position factor (#2) ──────────────────────────
+  # Down-weights outlier fixes (multipath under canopy, EKF glitches) instead of
+  # letting a single bad fix yank a keyframe and smear its neighbours.
+  robust_kernel: huber                       # none|huber|cauchy|gm|dcs|tukey
+  robust_threshold: 1.345                    # kernel width in WHITENED (sigma) units, NOT metres
+
+  # ── Temporal alignment to the LIO clock (#4/#6) ────────────────────────────
+  interpolate: true                          # linearly interpolate GPS position to the exact keyframe timestamp
+  max_interp_dt: 0.30                        # [s] max bracket gap for interpolation; beyond this, use nearest fix
+  time_offset: 0.0                           # [s] added to GPS/fix stamps to align them to the LIO clock.
+                                             # +ve if GPS timestamps lag LIO. Estimate once via GPS-vs-LIO speed
+                                             # cross-correlation; this removes a heading-dependent XY bias.

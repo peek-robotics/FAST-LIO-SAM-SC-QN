@@ -70,6 +70,23 @@ struct GpsParams
 
     // Ground prior
     bool use_ground_prior = false;
+
+    // Robust kernel on the GPS position factor (#2) — down-weights outlier fixes
+    // (multipath under canopy, EKF glitches) instead of letting them yank a node.
+    std::string robust_kernel = "none";  ///< none|huber|cauchy|gm|dcs|tukey
+    double      robust_thresh = 1.345;   ///< kernel width in WHITENED (sigma) units, not metres
+
+    // Temporal alignment (#4/#6)
+    double time_offset   = 0.0;   ///< [s] added to GPS/fix stamps at ingestion to align them to the LIO clock
+    bool   interpolate   = true;  ///< linearly interpolate GPS position/cov to the exact keyframe timestamp
+    double max_interp_dt = 0.30;  ///< [s] max bracket gap for interpolation; beyond this, use the nearest fix
+
+    // GPS lever arm: the GPS-reported point expressed in the SLAM body (node) frame [m].
+    // Applied as a pre-correction of the measurement before adding a plain GPSFactor:
+    //   corrected_xyz = gps_xyz - R_node * arm
+    // Equivalently constrains  pose.t == gps - R*arm , i.e.  pose.t + R*arm == gps .
+    // [0,0,0] on Grover (the SLAM node frame == the frame robot_localization reports GPS in).
+    Eigen::Vector3d lever_arm = Eigen::Vector3d::Zero();
 };
 
 ///
@@ -120,9 +137,13 @@ public:
 
     // ── Per-keyframe GPS factor ───────────────────────────────────────────────
     /// Attempts to add GPS position (and optional GPS-derived yaw) factors into
-    /// graph_out.  Returns metadata about what was added.
+    /// graph_out.  node_pose_corrected is the current estimated pose of the new
+    /// keyframe node (4x4 homogeneous) — used to rotate the lever arm into the
+    /// world frame for the measurement pre-correction.  Returns metadata about
+    /// what was added.
     FactorResult tryAddFactor(double kf_time, int node_idx,
-                              double traveled_dist, double current_z,
+                              double traveled_dist,
+                              const Eigen::Matrix4d& node_pose_corrected,
                               gtsam::NonlinearFactorGraph& graph_out);
 
     // ── Visualization ─────────────────────────────────────────────────────────
@@ -203,6 +224,10 @@ private:
     /// Caller MUST hold gps_mutex_ (because this also acquires fix_mutex_).
     const GpsFixTier* resolveFixTier(double msg_time);
 
+    /// Build the GPS position-factor noise model: diagonal variances, optionally
+    /// wrapped in a robust m-estimator per robust_kernel/robust_thresh (#2).
+    gtsam::noiseModel::Base::shared_ptr makeGpsNoise(const gtsam::Vector3& var) const;
+
     /// Returns false and logs if the current fix type is below the init gate.
     bool isReadyForInitSample() const;
 
@@ -217,9 +242,13 @@ private:
 
     /// Accept a single GPS fix (all gates already passed) into the factor graph.
     /// Updates all bookkeeping. Caller holds gps_mutex_.
+    /// node_pose_corrected is the current estimated pose of the keyframe node
+    /// (4x4 homogeneous, base_footprint frame) — used to rotate the lever arm into
+    /// the world frame for the measurement pre-correction.
     FactorResult acceptFixIntoGraph(const nav_msgs::Odometry& gps_msg, const GpsFixTier& tier,
                                     int8_t fix_status, int node_idx,
                                     double traveled_dist, double current_z,
+                                    const Eigen::Matrix4d& node_pose_corrected,
                                     bool hdg_has, double hdg_yaw,
                                     gtsam::NonlinearFactorGraph& graph_out);
 };

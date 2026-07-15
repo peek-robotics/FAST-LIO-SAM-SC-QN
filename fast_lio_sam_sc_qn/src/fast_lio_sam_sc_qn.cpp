@@ -66,6 +66,29 @@ GpsParams FastLioSamScQn::loadGpsParams(const ros::NodeHandle& nh)
     nh.param<bool>("/gps/lm_every_factor",       p.lm_every_factor,     false);
     nh.param<bool>("/gps/use_ground_prior",      p.use_ground_prior,    false);
 
+    // #2 Robust kernel on the GPS position factor.
+    nh.param<std::string>("/gps/robust_kernel",  p.robust_kernel, std::string("none"));
+    nh.param<double>("/gps/robust_threshold",    p.robust_thresh, 1.345);
+    // #4/#6 Temporal alignment of GPS to the keyframe (LIO) clock.
+    nh.param<double>("/gps/time_offset",         p.time_offset,   0.0);
+    nh.param<bool>("/gps/interpolate",           p.interpolate,   true);
+    nh.param<double>("/gps/max_interp_dt",       p.max_interp_dt, 0.30);
+    // #7 GPS lever arm [x,y,z] of the GPS-reported point in the SLAM body (node) frame.
+    // Applied as a measurement pre-correction (corrected = gps - R_node*arm) before
+    // adding a plain GPSFactor. [0,0,0] means node frame == GPS frame (Grover default).
+    std::vector<double> lever_arm;
+    if (nh.getParam("/gps/lever_arm", lever_arm) && lever_arm.size() == 3)
+    {
+        p.lever_arm = Eigen::Vector3d(lever_arm[0], lever_arm[1], lever_arm[2]);
+        ROS_INFO("[GPS] Lever arm set: (%.3f, %.3f, %.3f) m -- applying as measurement pre-correction",
+                 lever_arm[0], lever_arm[1], lever_arm[2]);
+    }
+    if (p.robust_kernel != "none")
+        ROS_INFO("[GPS] Robust GPS kernel: %s (threshold=%.3f whitened)",
+                 p.robust_kernel.c_str(), p.robust_thresh);
+    if (p.time_offset != 0.0)
+        ROS_INFO("[GPS] GPS->LIO time offset: %.4f s", p.time_offset);
+
     std::string heading_topic;
     nh.param<std::string>("/gps/heading_topic", heading_topic, "");
     p.has_heading_topic = !heading_topic.empty();
@@ -146,17 +169,19 @@ void FastLioSamScQn::loadParams(LoopClosureConfig& lc_config, double& loop_hz, d
     nh_.param<bool>("/basic/publish_tf",         publish_tf_,   true);
     nh_.param<bool>("/basic/init_from_tf",       init_from_tf_, true);
     nh_.param<bool>("/basic/input_pcd_lidar_frame", input_pcd_lidar_frame_, false);
+    nh_.param<std::string>("/basic/lidar_frame", lidar_frame_, std::string("livox_frame"));
     nh_.param<double>("/basic/max_odom_jump_m",  max_odom_jump_m_, 3.0);
     nh_.param<double>("/basic/lio_cov_threshold",lio_cov_threshold_, 1.0);
     nh_.param<bool>("/basic/reinit_on_jump",     reinit_on_jump_, true);
     nh_.param<int>("/basic/reinit_skip_frames",  reinit_skip_frames_, 10);
+    nh_.param<int>("/basic/degrade_accept_max",  degrade_accept_max_, 8);
     nh_.param<double>("/basic/loop_update_hz",   loop_hz, 1.0);
     nh_.param<double>("/basic/vis_hz",           vis_hz, 0.5);
     nh_.param<double>("/save_voxel_resolution",  voxel_res_, 0.3);
     nh_.param<double>("/quatro_nano_gicp_voxel_resolution", lc_config.voxel_res_, 0.3);
     /* keyframe */
     nh_.param<double>("/keyframe/keyframe_threshold",         keyframe_thr_, 1.0);
-    nh_.param<int>("/keyframe/nusubmap_keyframes",            lc_config.num_submap_keyframes_, 5);
+    nh_.param<int>("/keyframe/num_submap_keyframes",          lc_config.num_submap_keyframes_, 5);
     nh_.param<bool>("/keyframe/enable_submap_matching",       lc_config.enable_submap_matching_, false);
     /* ScanContext */
     nh_.param<double>("/scancontext_dist_threshold",
@@ -171,7 +196,7 @@ void FastLioSamScQn::loadParams(LoopClosureConfig& lc_config, double& loop_hz, d
     nh_.param<int>("/nano_gicp/thread_number",              gc.nano_thread_number_, 0);
     nh_.param<double>("/nano_gicp/icp_score_threshold",     gc.icp_score_thr_, 10.0);
     nh_.param<int>("/nano_gicp/correspondences_number",     gc.nano_correspondences_number_, 15);
-    nh_.param<double>("/nano_gicp/max_correspondence_distance", gc.max_corr_dist_, 0.01);
+    nh_.param<double>("/nano_gicp/max_correspondence_distance", gc.max_corr_dist_, 2.0);
     nh_.param<int>("/nano_gicp/max_iter",                   gc.nano_max_iter_, 32);
     nh_.param<double>("/nano_gicp/transformation_epsilon",  gc.transformation_epsilon_, 0.01);
     nh_.param<double>("/nano_gicp/euclidean_fitness_epsilon",gc.euclidean_fitness_epsilon_, 0.01);
@@ -183,14 +208,14 @@ void FastLioSamScQn::loadParams(LoopClosureConfig& lc_config, double& loop_hz, d
     nh_.param<bool>("/quatro/enable",               lc_config.enable_quatro_,          false);
     nh_.param<bool>("/quatro/optimize_matching",    qc.use_optimized_matching_,         true);
     nh_.param<double>("/quatro/distance_threshold", qc.quatro_distance_threshold_,      30.0);
-    nh_.param<int>("/quatro/max_nucorrespondences", qc.quatro_max_num_corres_,          200);
+    nh_.param<int>("/quatro/max_correspondences",   qc.quatro_max_num_corres_,          200);
     nh_.param<double>("/quatro/fpfh_normal_radius", qc.fpfh_normal_radius_,             0.3);
     nh_.param<double>("/quatro/fpfh_radius",        qc.fpfh_radius_,                   0.5);
     nh_.param<bool>("/quatro/estimating_scale",     qc.estimat_scale_,                 false);
     nh_.param<double>("/quatro/noise_bound",        qc.noise_bound_,                   0.3);
     nh_.param<double>("/quatro/rotation/gnc_factor",            qc.rot_gnc_factor_,    1.4);
     nh_.param<double>("/quatro/rotation/rot_cost_diff_threshold",qc.rot_cost_diff_thr_, 0.0001);
-    nh_.param<int>("/quatro/rotation/numax_iter",               qc.quatro_max_iter_,   50);
+    nh_.param<int>("/quatro/rotation/num_max_iter",             qc.quatro_max_iter_,   50);
     /* results */
     nh_.param<bool>("/result/save_map_pcd",        save_map_pcd_,         false);
     nh_.param<std::string>("/result/seq_name",     seq_name_,             "");
@@ -208,6 +233,7 @@ void FastLioSamScQn::loadParams(LoopClosureConfig& lc_config, double& loop_hz, d
     }
     /* misc */
     nh_.param<double>("/basic/init_prior_noise_z", init_prior_noise_z_, 1.0);
+    nh_.param<double>("/basic/init_prior_noise_yaw_unknown", init_prior_noise_yaw_unknown_, 1.0);
 }
 
 // ── setupRos ──────────────────────────────────────────────────────────────────
@@ -304,7 +330,9 @@ void FastLioSamScQn::setupRos(double loop_hz, double vis_hz,
         sub_heading_ = nh_.subscribe(heading_topic, 10, &GpsHandler::onHeading, &gps_handler_,
                                      ros::TransportHints().tcpNoDelay());
 
-    sub_lio_diag_ = nh_.subscribe("/lidar_3d/voxel_slam/lio_diag", 10,
+    std::string t_lio_diag;
+    nh_.param<std::string>("/topics/lio_diag", t_lio_diag, "/lidar_3d/voxel_slam/lio_diag");
+    sub_lio_diag_ = nh_.subscribe(t_lio_diag, 10,
                                    &FastLioSamScQn::lioDiagCallback, this,
                                    ros::TransportHints().tcpNoDelay());
 
@@ -355,6 +383,46 @@ void FastLioSamScQn::initComponents(const LoopClosureConfig& lc_config)
             ROS_WARN("[Init] TF %s -> %s not available within 2 s -- starting at origin",
                      map_frame_.c_str(), robot_frame_.c_str());
     }
+
+    // Cache the static base->lidar extrinsic used to render LiDAR-frame clouds into the map.
+    ensureLidarExtrinsic(2.0, true);
+    // Loop-closure builds submaps by transforming stored LiDAR-frame keyframe clouds by their
+    // base-frame node poses, so it needs the same base->lidar composition renderPose() uses.
+    if (input_pcd_lidar_frame_ && lidar_extrinsic_ready_)
+        loop_closure_->setRenderExtrinsic(T_base_lidar_);
+}
+
+void FastLioSamScQn::ensureLidarExtrinsic(double wait_s, bool verbose)
+{
+    if (lidar_extrinsic_ready_ || !input_pcd_lidar_frame_)
+        return;
+    if (!tf_listener_.waitForTransform(robot_frame_, lidar_frame_, ros::Time(0), ros::Duration(wait_s)))
+    {
+        if (verbose)
+            ROS_WARN("[Init] base->lidar TF %s -> %s not available within %.1f s -- clouds rendered "
+                     "WITHOUT lever arm (map may show heading-dependent doubling)",
+                     robot_frame_.c_str(), lidar_frame_.c_str(), wait_s);
+        return;
+    }
+    tf::StampedTransform tf_bl;
+    tf_listener_.lookupTransform(robot_frame_, lidar_frame_, ros::Time(0), tf_bl);
+    Eigen::Affine3d e;
+    tf::transformTFToEigen(tf_bl, e);
+    T_base_lidar_ = e.matrix();
+    lidar_extrinsic_ready_ = true;
+    ROS_INFO("[Init] base->lidar extrinsic %s -> %s: t=(%.3f, %.3f, %.3f) -- rendering clouds with lever arm",
+             robot_frame_.c_str(), lidar_frame_.c_str(),
+             T_base_lidar_(0, 3), T_base_lidar_(1, 3), T_base_lidar_(2, 3));
+}
+
+Eigen::Matrix4d FastLioSamScQn::renderPose(const Eigen::Matrix4d& node_pose) const
+{
+    // Keyframe clouds are stored in the LiDAR frame (input_pcd_lidar_frame_), but the graph node
+    // pose is base_footprint. Compose the static base->lidar extrinsic so points land at their true
+    // map position. When the extrinsic is unavailable, fall back to the node pose (previous behaviour).
+    if (input_pcd_lidar_frame_ && lidar_extrinsic_ready_)
+        return node_pose * T_base_lidar_;
+    return node_pose;
 }
 
 // ── Destructor ────────────────────────────────────────────────────────────────
@@ -377,6 +445,27 @@ void FastLioSamScQn::odomPcdCallback(const nav_msgs::OdometryConstPtr& odom_msg,
 {
     const Eigen::Matrix4d last_odom_tf = current_frame_.pose_eig_;
     current_frame_ = PosePcd(*odom_msg, *pcd_msg, current_keyframe_idx_, input_pcd_lidar_frame_);
+
+    // voxel_slam odometry is the LiDAR-frame pose (its odom child_frame is base_link = lidar_frame),
+    // but the graph node / GPS / output frame is robot_frame (base_footprint). Convert the incoming
+    // pose livox->base once here so every downstream consumer (odom delta, BetweenFactors, init,
+    // realtime pose, TF, GPS comparison) is consistently base_footprint. renderPose() then composes
+    // the base->lidar extrinsic back only when placing the LiDAR-frame cloud. Without this the node
+    // sits in a livox/base blend and renderPose adds a full lever arm -> heading-flip map ghosting
+    // (~2x the forward offset). last_odom_tf above is the previous (already-converted) base pose, so
+    // the frame-to-frame delta stays consistent.
+    if (input_pcd_lidar_frame_ && lidar_extrinsic_ready_)
+    {
+        const Eigen::Matrix4d T_lidar_base = T_base_lidar_.inverse();
+        current_frame_.pose_eig_           = current_frame_.pose_eig_ * T_lidar_base;
+        current_frame_.pose_corrected_eig_ = current_frame_.pose_corrected_eig_ * T_lidar_base;
+    }
+    else if (input_pcd_lidar_frame_)
+    {
+        ROS_WARN_ONCE("[LIO] base<-lidar extrinsic unavailable; node pose left in LiDAR frame "
+                      "(GPS/node frame mismatch, expect map ghosting until TF is found)");
+    }
+
     perf_frames_total_.fetch_add(1, std::memory_order_relaxed);
 
     if (!passLioHealthChecks(odom_msg, last_odom_tf))
@@ -399,7 +488,9 @@ void FastLioSamScQn::odomPcdCallback(const nav_msgs::OdometryConstPtr& odom_msg,
         return;
     }
 
-    if (current_frame_.is_degenerate_ || !checkIfKeyframe(current_frame_, keyframes_.back()))
+    // Degenerate frames are still allowed to become keyframes (with loosened odom noise) so the
+    // graph has no gap during a degeneracy stretch; only keyframe spacing gates entry here.
+    if (!checkIfKeyframe(current_frame_, keyframes_.back()))
         return;
 
     const high_resolution_clock::time_point t2 = high_resolution_clock::now();
@@ -425,14 +516,21 @@ void FastLioSamScQn::odomPcdCallback(const nav_msgs::OdometryConstPtr& odom_msg,
 bool FastLioSamScQn::passLioHealthChecks(const nav_msgs::OdometryConstPtr& odom_msg,
                                           const Eigen::Matrix4d& last_odom_tf)
 {
-    // Gate 0: voxel_slam degeneracy (degrade_state > 1 = Low/Medium/High/Reset)
-    if (latest_diag_state_.load() > 1)
+    // Gate 0: voxel_slam degeneracy (degrade_state: Ok=1, Low=2, Medium=4, High=8, Reset=16).
+    // Accept Low/Medium/High (<= degrade_accept_max_) but flag them so the odom factor is trusted
+    // less (loose _degen noise); drop only Reset -- and anything degenerate before init, since node 0
+    // anchors the whole map. Gate 1 (jump) still reinits genuinely broken frames below.
+    const uint8_t diag = latest_diag_state_.load();
+    const bool pre_init_dirty = (!is_initialized_ && diag > 1);
+    if (diag > degrade_accept_max_ || pre_init_dirty)
     {
-        ROS_WARN_THROTTLE(1.0, "[LIO] Dropping frame: voxel_slam degrade_state=%u",
-                          static_cast<unsigned>(latest_diag_state_.load()));
+        ROS_WARN_THROTTLE(1.0, "[LIO] Dropping frame: voxel_slam degrade_state=%u (accept_max=%d%s)",
+                          static_cast<unsigned>(diag), degrade_accept_max_,
+                          pre_init_dirty ? ", pre-init requires clean" : "");
         perf_frames_dropped_.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+    const bool diag_degenerate = (diag > 1);  // Low/Medium/High -> accept but downweight
 
     // Gate 1: inter-frame position jump
     const Eigen::Vector3d frame_delta = (last_odom_tf.inverse() * current_frame_.pose_eig_).block<3,1>(0,3);
@@ -475,6 +573,11 @@ bool FastLioSamScQn::passLioHealthChecks(const nav_msgs::OdometryConstPtr& odom_
             }
             gps_handler_.armReentry();
             post_reinit_frames_remaining_ = reinit_skip_frames_;
+            // The odom between-factor that will bridge the last pre-reset keyframe to the
+            // first post-reset keyframe spans un-tracked motion during the outage. Flag it so
+            // it is staged with loose (degenerate) noise instead of tight odom noise — otherwise
+            // the graph honours a tight-but-wrong transform and distorts poses around the reset.
+            bridge_after_reinit_ = true;
         }
         else if (!reinit_on_jump_)
         {
@@ -483,8 +586,10 @@ bool FastLioSamScQn::passLioHealthChecks(const nav_msgs::OdometryConstPtr& odom_
         return false;
     }
 
-    // Gate 2: FAST-LIO covariance
+    // Gate 2: FAST-LIO covariance. Combined with the diag signal from Gate 0 so a frame flagged
+    // degenerate by either source gets the loose odom noise (works even if lio_cov_threshold_ <= 0).
     first_odom_received_ = true;
+    bool cov_degenerate = false;
     if (lio_cov_threshold_ > 0.0)
     {
         const double pos_cov_trace = odom_msg->pose.covariance[0]
@@ -493,8 +598,9 @@ bool FastLioSamScQn::passLioHealthChecks(const nav_msgs::OdometryConstPtr& odom_
         if (pos_cov_trace > lio_cov_threshold_)
             ROS_WARN_THROTTLE(2.0, "[LIO] Degenerate frame (cov trace=%.4f > %.4f)",
                               pos_cov_trace, lio_cov_threshold_);
-        current_frame_.is_degenerate_ = (pos_cov_trace > lio_cov_threshold_);
+        cov_degenerate = (pos_cov_trace > lio_cov_threshold_);
     }
+    current_frame_.is_degenerate_ = diag_degenerate || cov_degenerate;
     return true;
 }
 
@@ -547,7 +653,7 @@ void FastLioSamScQn::publishRealtimePose(const nav_msgs::OdometryConstPtr& odom_
     }
     if (is_initialized_ && corrected_current_pcd_pub_.getNumSubscribers() > 0)
         corrected_current_pcd_pub_.publish(
-            pclToPclRos(transformPcd(current_frame_.pcd_, current_frame_.pose_corrected_eig_), map_frame_));
+            pclToPclRos(transformPcd(current_frame_.pcd_, renderPose(current_frame_.pose_corrected_eig_)), map_frame_));
 }
 
 // ── tryInitialize ─────────────────────────────────────────────────────────────
@@ -603,13 +709,21 @@ void FastLioSamScQn::tryInitialize()
     init_alt_ = snap.z;
     init_x_   = snap.x;
     init_y_   = snap.y;
-    if (!std::isnan(snap.yaw))
+    const bool have_gps_heading = !std::isnan(snap.yaw);
+    if (have_gps_heading)
     {
         const gtsam::Rot3 lio_rot = init_pose.rotation();
         const gtsam::Rot3 gps_rot = gtsam::Rot3::RzRyRx(lio_rot.roll(), lio_rot.pitch(), snap.yaw);
         init_pose = gtsam::Pose3(gps_rot, init_pose.translation());
         ROS_INFO("\033[1;32m[Init] Using GPS heading yaw=%.1f deg for GTSAM prior.\033[0m",
                  snap.yaw * 180.0 / M_PI);
+    }
+    else
+    {
+        ROS_WARN("[Init] No GPS/heading yaw at init -- origin yaw taken from %s and left LOOSE "
+                 "(var=%.3g rad^2) so GPS + motion can rotate the map.",
+                 (init_from_tf_ && tf_at_heading_valid_) ? "TF" : "LIO",
+                 init_prior_noise_yaw_unknown_);
     }
     init_pose = gtsam::Pose3(init_pose.rotation(), gtsam::Point3(snap.x, snap.y, snap.z));
     ROS_INFO("\033[1;32m[Init] Using GPS position for origin: (%.2f, %.2f, %.2f)\033[0m",
@@ -628,7 +742,11 @@ void FastLioSamScQn::tryInitialize()
         updateOdomsAndPaths(current_frame_);
     }
 
-    auto var = (gtsam::Vector(6) << 1e-4, 1e-4, 1e-4, 1e-2, 1e-2, init_prior_noise_z_).finished();
+    // Yaw prior is tight only when a GPS/heading source fixed the initial yaw. Without one,
+    // the map's absolute rotation is unknown at init; a tight yaw prior would lock the whole
+    // map to LIO's arbitrary start heading and fight later GPS position factors.
+    const double yaw_var = have_gps_heading ? 1e-4 : init_prior_noise_yaw_unknown_;
+    auto var = (gtsam::Vector(6) << 1e-4, 1e-4, yaw_var, 1e-2, 1e-2, init_prior_noise_z_).finished();
     auto prior_noise = gtsam::noiseModel::Diagonal::Variances(var);
     // initGraph inserts key 0 into staged_init_ — do NOT call stageInitValue(0) afterwards.
     isam_backend_.initGraph(init_pose, prior_noise, 0);
@@ -669,7 +787,17 @@ void FastLioSamScQn::processKeyframe(const nav_msgs::OdometryConstPtr& odom_msg)
     const gtsam::Pose3 pose_to   = poseEigToGtsamPose(current_frame_.pose_corrected_eig_);
 
     // Stage odometry factor.
-    isam_backend_.stageOdomFactor(prev_idx, curr_idx, pose_from, pose_to, current_frame_.is_degenerate_);
+    // Loosen the odom factor for the first keyframe after a LIO reinit (bridge across the
+    // degeneracy/outage gap), so GPS can re-pin it without a tight-but-wrong constraint fighting.
+    const bool bridge = bridge_after_reinit_;
+    bridge_after_reinit_ = false;
+    if (bridge)
+        ROS_WARN("[LIO] Bridging keyframe %d after reinit -- odom position loosened, rotation kept tight",
+                 curr_idx);
+    else if (current_frame_.is_degenerate_)
+        ROS_INFO_THROTTLE(1.0, "[LIO] Degenerate keyframe %d accepted -- odom factor loosened", curr_idx);
+    isam_backend_.stageOdomFactor(prev_idx, curr_idx, pose_from, pose_to,
+                                  current_frame_.is_degenerate_, bridge);
     isam_backend_.stageInitValue(curr_idx, pose_to);
 
     // Build additional factors for this keyframe.
@@ -679,7 +807,7 @@ void FastLioSamScQn::processKeyframe(const nav_msgs::OdometryConstPtr& odom_msg)
     // GPS position (and optional GPS-derived heading) factor.
     auto gps_result = gps_handler_.tryAddFactor(odom_msg->header.stamp.toSec(), curr_idx,
                                                   gps_total_path_length_,
-                                                  current_frame_.pose_corrected_eig_(2,3),
+                                                  current_frame_.pose_corrected_eig_,
                                                   kf_factors);
     if (gps_result.factor_added)
     {
@@ -765,6 +893,15 @@ void FastLioSamScQn::loopTimerFunc(const ros::TimerEvent& /*event*/)
 {
     if (!is_initialized_)
         return;
+
+    // Self-heal: if the base->lidar TF only became available after startup, cache it now and
+    // hand it to loop closure so its submaps compose the lever arm (idempotent once ready).
+    if (input_pcd_lidar_frame_ && !lidar_extrinsic_ready_)
+    {
+        ensureLidarExtrinsic(0.0, false);
+        if (lidar_extrinsic_ready_)
+            loop_closure_->setRenderExtrinsic(T_base_lidar_);
+    }
 
     // ── Snapshot the latest unprocessed keyframe under lock ──────────────────
     // keyframes_ is mutated by processKeyframe() (running on spinner threads via
@@ -875,6 +1012,8 @@ void FastLioSamScQn::visTimerFunc(const ros::TimerEvent& /*event*/)
     if (!is_initialized_)
         return;
 
+    ensureLidarExtrinsic(0.0, false);  // recover the base->lidar extrinsic if TF was late at startup
+
     const high_resolution_clock::time_point tv1 = high_resolution_clock::now();
 
     if (loop_added_flag_vis_)
@@ -921,7 +1060,7 @@ void FastLioSamScQn::visTimerFunc(const ros::TimerEvent& /*event*/)
         {
             std::lock_guard<std::mutex> lk(keyframes_mutex_);
             for (size_t i = 0; i < keyframes_.size(); ++i)
-                *corrected_map += transformPcd(keyframes_[i].pcd_, keyframes_[i].pose_corrected_eig_);
+                *corrected_map += transformPcd(keyframes_[i].pcd_, renderPose(keyframes_[i].pose_corrected_eig_));
         }
         const auto& voxelized = voxelizePcd(corrected_map, voxel_res_);
         corrected_pcd_map_pub_.publish(pclToPclRos(*voxelized, map_frame_));
@@ -1002,6 +1141,8 @@ std::string FastLioSamScQn::saveMapPcd(const std::string& base_dir)
 {
     if (keyframes_.empty()) return {};
 
+    ensureLidarExtrinsic(1.0, true);  // render the saved map with the base->lidar extrinsic
+
     // Build timestamped subdirectory: base_dir/YYYY-MM-DD-HH-MM/
     const std::time_t now = std::time(nullptr);
     char ts[32];
@@ -1022,7 +1163,7 @@ std::string FastLioSamScQn::saveMapPcd(const std::string& base_dir)
     {
         std::lock_guard<std::mutex> lk(keyframes_mutex_);
         for (size_t i = 0; i < keyframes_.size(); ++i)
-            *map += transformPcd(keyframes_[i].pcd_, keyframes_[i].pose_corrected_eig_);
+            *map += transformPcd(keyframes_[i].pcd_, renderPose(keyframes_[i].pose_corrected_eig_));
     }
     const auto& voxelized = voxelizePcd(map, voxel_res_);
 
