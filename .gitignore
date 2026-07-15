@@ -3,3 +3,5 @@
 fast_lio_sam_qn/*.bag
 /fast_lio_sam_sc_qn/result.pcd
 /fast_lio_sam_sc_qn/sequence*/
+.tokensave
+AGENTS.md
