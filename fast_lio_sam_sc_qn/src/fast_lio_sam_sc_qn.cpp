@@ -1337,8 +1337,11 @@ bool FastLioSamScQn::saveMapSrvCallback(std_srvs::Trigger::Request& /*req*/,
         return true;
     }
 
+    // Contract: on success, `message` is EXACTLY the output directory (no prose),
+    // so callers (e.g. grover_navigation map_export) can consume it directly.
+    // Human-readable status is logged by saveMapPcd via ROS_INFO.
     res.success = true;
-    res.message = "Map saved to " + out_dir;
+    res.message = out_dir;
     return true;
 }
 
