@@ -1243,10 +1243,24 @@ std::string FastLioSamScQn::saveMapPcd(const std::string& base_dir)
             ofs << "    longitude: null\n";
             ofs << "    altitude:  null\n";
         }
-        if (!std::isnan(init_x_) && !std::isnan(init_y_))
+        // init_utm MUST be the map-frame position of the point init_gps
+        // describes, so georeferencing pins that map point to that WGS-84 fix.
+        // On the /toLL path init_gps is the map origin (0,0,0), so init_utm is
+        // (0,0,0); only on the node-0 fallback is it node 0's map position.
+        // (Writing node 0's offset alongside the origin's GPS shifts the whole
+        // georeferenced cloud by that offset — see grover_slam_tools georef.)
+        if (got_gps_from_toll)
         {
             ofs << "  init_utm:\n";
-            ofs << "    description: \"UTM coordinates of GTSAM node 0 at initialisation\"\n";
+            ofs << "    description: \"Map origin (0,0,0) map-frame position\"\n";
+            ofs << "    x: 0.0  # easting  [m]\n";
+            ofs << "    y: 0.0  # northing [m]\n";
+            ofs << "    z: 0.0  # altitude [m]\n";
+        }
+        else if (!std::isnan(init_x_) && !std::isnan(init_y_))
+        {
+            ofs << "  init_utm:\n";
+            ofs << "    description: \"GTSAM node 0 map-frame position at initialisation\"\n";
             ofs << "    x: " << init_x_ << "  # easting  [m]\n";
             ofs << "    y: " << init_y_ << "  # northing [m]\n";
             ofs << "    z: " << init_alt_ << "  # altitude [m]\n";
