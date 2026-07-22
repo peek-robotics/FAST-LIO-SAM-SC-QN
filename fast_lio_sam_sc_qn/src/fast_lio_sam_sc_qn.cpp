@@ -1185,16 +1185,24 @@ std::string FastLioSamScQn::saveMapPcd(const std::string& base_dir)
         ofs << "keyframes: " << keyframes_.size() << "\n";
         ofs << "origin:\n";
 
-        // Prefer converting the map origin (0,0,0) to WGS-84 via the /toLL
-        // service (robot_localization NavSatTransform), which reflects the
-        // live map↔world transform. Fall back to the GTSAM node 0 GPS fix
-        // captured at SLAM init time if the service is unavailable.
+        // PHASE 2: prefer the GTSAM node-0 datum captured at init (its exact
+        // WGS-84 fix + map position). The map frame is a true-north local ENU
+        // frame pinned at that datum (see gps_handler onGpsOdom), so node-0
+        // lat/lon paired with init_utm re-project to UTM exactly (grover_slam_tools
+        // georef). The /toLL service reflects navsat's UTM-grid transform, whose
+        // meridian convergence is uncorrected -- for the map origin ~5 m off node 0
+        // that mislocates the datum by ~0.1-0.2 m and shifts the whole cloud. So
+        // use /toLL only as a fallback when no init datum is available.
         bool got_gps_from_toll = false;
         double gps_lat = std::numeric_limits<double>::quiet_NaN();
         double gps_lon = std::numeric_limits<double>::quiet_NaN();
         double gps_alt = std::numeric_limits<double>::quiet_NaN();
 
-        if (to_ll_client_.exists())
+        if (!std::isnan(init_lat_) && !std::isnan(init_lon_))
+        {
+            ROS_INFO("[Save] Origin GPS from GTSAM node-0 init datum (exact; true-north ENU frame).");
+        }
+        else if (to_ll_client_.exists())
         {
             robot_localization::ToLL toll_req;
             toll_req.request.map_point.x = 0.0;

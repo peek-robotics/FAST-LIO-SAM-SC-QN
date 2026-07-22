@@ -5,6 +5,50 @@
 
 #include <gtsam/linear/NoiseModel.h>  // noiseModel::Robust + mEstimator kernels (#2)
 
+namespace
+{
+// PHASE 2 georeferencing fix. Convert a WGS-84 geodetic point to a local ENU
+// (east/north/up) offset from a datum, via geodetic -> ECEF -> ENU on the WGS-84
+// ellipsoid. This is a true-north, true-metric tangent-plane frame: unlike
+// navsat's UTM output it carries NO meridian convergence and NO grid scale, so
+// the GPS position factors agree with the true-north GPS heading factor and the
+// true-metric LIO backbone (which navsat's grid frame does not -- they differ by
+// the convergence angle, ~1.4-1.6 deg in NZ, warping the map with distance from
+// the origin). This is the exact inverse of the ENU->ECEF->UTM projection in
+// grover_slam_tools/georef.py, so saved maps re-project to UTM exactly.
+void geodeticToEnu(double lat_deg, double lon_deg, double alt,
+                   double lat0_deg, double lon0_deg, double alt0,
+                   double& e, double& n, double& u)
+{
+    constexpr double a   = 6378137.0;            // WGS-84 semi-major axis [m]
+    constexpr double f   = 1.0 / 298.257223563;  // WGS-84 flattening
+    constexpr double e2  = f * (2.0 - f);        // first eccentricity squared
+    constexpr double deg = M_PI / 180.0;
+
+    auto toEcef = [&](double la, double lo, double h,
+                      double& X, double& Y, double& Z) {
+        const double sla = std::sin(la), cla = std::cos(la);
+        const double slo = std::sin(lo), clo = std::cos(lo);
+        const double N = a / std::sqrt(1.0 - e2 * sla * sla);
+        X = (N + h) * cla * clo;
+        Y = (N + h) * cla * slo;
+        Z = (N * (1.0 - e2) + h) * sla;
+    };
+
+    const double phi = lat0_deg * deg, lam = lon0_deg * deg;
+    double X0, Y0, Z0, X, Y, Z;
+    toEcef(phi, lam, alt0, X0, Y0, Z0);
+    toEcef(lat_deg * deg, lon_deg * deg, alt, X, Y, Z);
+
+    const double dX = X - X0, dY = Y - Y0, dZ = Z - Z0;
+    const double sp = std::sin(phi), cp = std::cos(phi);
+    const double sl = std::sin(lam), cl = std::cos(lam);
+    e = -sl * dX + cl * dY;
+    n = -sp * cl * dX - sp * sl * dY + cp * dZ;
+    u =  cp * cl * dX + cp * sl * dY + sp * dZ;
+}
+}  // namespace
+
 // ── Construction ───────────────────────────────────────────────────────────────
 
 GpsHandler::GpsHandler(const GpsParams& p)
@@ -69,11 +113,39 @@ void GpsHandler::onGpsOdom(const nav_msgs::OdometryConstPtr& msg)
     double gx, gy, gz;
     {
         std::lock_guard<std::mutex> lk(gps_mutex_);
-        latest_gps_x_     = gx = msg->pose.pose.position.x;
-        latest_gps_y_     = gy = msg->pose.pose.position.y;
-        latest_gps_z_     = gz = msg->pose.pose.position.z;
         nav_msgs::Odometry m = *msg;
         m.header.stamp += ros::Duration(p_.time_offset);  // #6 align GPS stamp to the LIO clock
+
+        // PHASE 2: replace navsat's UTM-grid position with a true-north local ENU
+        // position (geodetic tangent plane at the init datum). navsat's output
+        // carries UTM meridian convergence + grid scale, which fight the true-north
+        // GPS heading and the true-metric LIO odometry and warp the map with
+        // distance from the origin. Reproject the horizontal from the time-matched
+        // raw fix; keep z (convergence is horizontal only). Offset by the init map
+        // position so node 0, the origin convention, and the saved metadata are
+        // unchanged. Pre-init (datum not yet set) the navsat position is kept -- it
+        // only feeds the init stability window, where the frame does not matter.
+        if (datum_set_)
+        {
+            double lat, lon, alt;
+            if (nearestFixLL(m.header.stamp.toSec(), lat, lon, alt))
+            {
+                double e, n, u;
+                geodeticToEnu(lat, lon, alt, init_lat_, init_lon_, init_gps_z_, e, n, u);
+                m.pose.pose.position.x = e + init_gps_x_;
+                m.pose.pose.position.y = n + init_gps_y_;
+                // z (navsat altitude) unchanged -- UTM convergence is horizontal.
+            }
+            else
+            {
+                ROS_WARN_THROTTLE(5.0, "[GPS] No raw fix within +/-0.15 s of GPS odom; using "
+                                       "navsat position (meridian convergence NOT corrected) this fix");
+            }
+        }
+
+        latest_gps_x_     = gx = m.pose.pose.position.x;
+        latest_gps_y_     = gy = m.pose.pose.position.y;
+        latest_gps_z_     = gz = m.pose.pose.position.z;
         gps_queue_.push_back(std::move(m));
         gps_first_received_ = true;
     }
@@ -137,7 +209,17 @@ void GpsHandler::finalizeInit(double yaw, double x, double y, double z)
         std::lock_guard<std::mutex> lk(gps_mutex_);
         init_lat_ = latest_lat_;
         init_lon_ = latest_lon_;
+        // PHASE 2: with the datum (init WGS-84) captured, onGpsOdom reprojects
+        // subsequent GPS positions into a true-north local ENU frame. Needs a
+        // valid lat/lon at init; otherwise GPS stays in navsat's (grid) frame.
+        datum_set_ = !std::isnan(init_lat_) && !std::isnan(init_lon_);
     }
+    if (datum_set_)
+        ROS_INFO("\033[1;32m[Init] GPS datum set (%.9f, %.9f); GPS positions now true-north local ENU.\033[0m",
+                 init_lat_, init_lon_);
+    else
+        ROS_WARN("[Init] No WGS-84 fix at init -- GPS positions stay in navsat frame "
+                 "(meridian convergence NOT corrected; map will warp with distance).");
     gps_heading_received_ = true;
 }
 
@@ -296,6 +378,38 @@ const GpsFixTier* GpsHandler::resolveFixTier(double msg_time)
               static_cast<int>(best_status), it->second.cov_gate,
               it->second.noise_floor, it->second.cov_scale);
     return &it->second;
+}
+
+// ── nearestFixLL (PHASE 2) ──────────────────────────────────────────────────────
+// Raw WGS-84 lat/lon/alt of the NavSatFix closest in time to `t` (within ±0.15 s),
+// used by onGpsOdom to reproject GPS odom into the true-north local-ENU datum
+// frame. Prunes fixes older than t-5 s so the queue stays bounded even when fix
+// tiers are off (resolveFixTier, the other pruner, is skipped then). The 5 s window
+// is intentionally wider than resolveFixTier's 1 s so this never drops a fix a
+// later keyframe's tier lookup still needs. Caller holds gps_mutex_; this also
+// locks fix_mutex_ (same lock order as resolveFixTier).
+bool GpsHandler::nearestFixLL(double t, double& lat, double& lon, double& alt)
+{
+    std::lock_guard<std::mutex> lk(fix_mutex_);
+
+    while (!fix_queue_.empty() && fix_queue_.front().header.stamp.toSec() < t - 5.0)
+        fix_queue_.pop_front();
+
+    double best_dt = 0.15 + 1e-9;
+    bool found = false;
+    for (const auto& fix : fix_queue_)
+    {
+        const double dt = std::abs(fix.header.stamp.toSec() - t);
+        if (dt < best_dt)
+        {
+            best_dt = dt;
+            lat = fix.latitude;
+            lon = fix.longitude;
+            alt = fix.altitude;
+            found = true;
+        }
+    }
+    return found;
 }
 
 GpsHandler::FactorResult GpsHandler::tryAddFactor(

@@ -186,6 +186,7 @@ private:
     double init_gps_z_           = 0.0;
     double init_lat_             = std::numeric_limits<double>::quiet_NaN();
     double init_lon_             = std::numeric_limits<double>::quiet_NaN();
+    bool   datum_set_            = false;  ///< PHASE 2: init WGS-84 datum captured -> GPS odom reprojected to true-north local ENU (onGpsOdom)
 
     // Latest cached heading from IMU heading topic
     mutable std::mutex heading_mutex_;
@@ -223,6 +224,11 @@ private:
     /// Looks up the quality tier for a GPS odometry message.
     /// Caller MUST hold gps_mutex_ (because this also acquires fix_mutex_).
     const GpsFixTier* resolveFixTier(double msg_time);
+
+    /// PHASE 2: nearest raw NavSatFix lat/lon/alt to time `t` (±0.15 s), used to
+    /// reproject GPS odom into the true-north local-ENU datum frame. Also prunes
+    /// stale fixes. Caller holds gps_mutex_; locks fix_mutex_ (order as resolveFixTier).
+    bool nearestFixLL(double t, double& lat, double& lon, double& alt);
 
     /// Build the GPS position-factor noise model: diagonal variances, optionally
     /// wrapped in a robust m-estimator per robust_kernel/robust_thresh (#2).
