@@ -100,6 +100,10 @@ void GpsHandler::onNavSatFix(const sensor_msgs::NavSatFixConstPtr& msg)
         sensor_msgs::NavSatFix f = *msg;
         f.header.stamp += ros::Duration(p_.time_offset);  // #6 keep fix time consistent with GPS odom
         fix_queue_.push_back(std::move(f));
+        // Bound the queue (resolveFixTier prunes it by time, but only when fix tiers
+        // are enabled). ~200 fixes is tens of seconds at 5-10 Hz -- ample for tiers.
+        while (fix_queue_.size() > 200)
+            fix_queue_.pop_front();
     }
     // Cache raw WGS-84 lat/lon for metadata export.
     // Protected by gps_mutex_ to avoid a separate lock.
@@ -120,27 +124,26 @@ void GpsHandler::onGpsOdom(const nav_msgs::OdometryConstPtr& msg)
         // position (geodetic tangent plane at the init datum). navsat's output
         // carries UTM meridian convergence + grid scale, which fight the true-north
         // GPS heading and the true-metric LIO odometry and warp the map with
-        // distance from the origin. Reproject the horizontal from the time-matched
-        // raw fix; keep z (convergence is horizontal only). Offset by the init map
-        // position so node 0, the origin convention, and the saved metadata are
-        // unchanged. Pre-init (datum not yet set) the navsat position is kept -- it
-        // only feeds the init stability window, where the frame does not matter.
-        if (datum_set_)
+        // distance from the origin. Reproject the horizontal from the raw fix's
+        // lat/lon (latest_lat_/latest_lon_, cached by onNavSatFix); keep z
+        // (convergence is horizontal only). Offset by the init map position so
+        // node 0, the origin convention, and the saved metadata are unchanged.
+        //
+        // Use the latest cached fix, NOT a timestamp-matched one: navsat derives
+        // /odometry/gps from /gps/fix, so the latest fix is the same measurement (at
+        // most one GPS epoch older). Matching by stamp in THIS callback races the
+        // fix push -- the odom callback can run before onNavSatFix has queued the
+        // matching fix, so the match fails and the correction silently falls back to
+        // grid. Pre-init (datum not set) the navsat position is kept -- it only
+        // feeds the init stability window, where the frame does not matter.
+        if (datum_set_ && !std::isnan(latest_lat_))
         {
-            double lat, lon, alt;
-            if (nearestFixLL(m.header.stamp.toSec(), lat, lon, alt))
-            {
-                double e, n, u;
-                geodeticToEnu(lat, lon, alt, init_lat_, init_lon_, init_gps_z_, e, n, u);
-                m.pose.pose.position.x = e + init_gps_x_;
-                m.pose.pose.position.y = n + init_gps_y_;
-                // z (navsat altitude) unchanged -- UTM convergence is horizontal.
-            }
-            else
-            {
-                ROS_WARN_THROTTLE(5.0, "[GPS] No raw fix within +/-0.15 s of GPS odom; using "
-                                       "navsat position (meridian convergence NOT corrected) this fix");
-            }
+            double e, n, u;
+            geodeticToEnu(latest_lat_, latest_lon_, m.pose.pose.position.z,
+                          init_lat_, init_lon_, init_gps_z_, e, n, u);
+            m.pose.pose.position.x = e + init_gps_x_;
+            m.pose.pose.position.y = n + init_gps_y_;
+            // z (navsat altitude) unchanged -- UTM convergence is horizontal only.
         }
 
         latest_gps_x_     = gx = m.pose.pose.position.x;
@@ -378,38 +381,6 @@ const GpsFixTier* GpsHandler::resolveFixTier(double msg_time)
               static_cast<int>(best_status), it->second.cov_gate,
               it->second.noise_floor, it->second.cov_scale);
     return &it->second;
-}
-
-// ── nearestFixLL (PHASE 2) ──────────────────────────────────────────────────────
-// Raw WGS-84 lat/lon/alt of the NavSatFix closest in time to `t` (within ±0.15 s),
-// used by onGpsOdom to reproject GPS odom into the true-north local-ENU datum
-// frame. Prunes fixes older than t-5 s so the queue stays bounded even when fix
-// tiers are off (resolveFixTier, the other pruner, is skipped then). The 5 s window
-// is intentionally wider than resolveFixTier's 1 s so this never drops a fix a
-// later keyframe's tier lookup still needs. Caller holds gps_mutex_; this also
-// locks fix_mutex_ (same lock order as resolveFixTier).
-bool GpsHandler::nearestFixLL(double t, double& lat, double& lon, double& alt)
-{
-    std::lock_guard<std::mutex> lk(fix_mutex_);
-
-    while (!fix_queue_.empty() && fix_queue_.front().header.stamp.toSec() < t - 5.0)
-        fix_queue_.pop_front();
-
-    double best_dt = 0.15 + 1e-9;
-    bool found = false;
-    for (const auto& fix : fix_queue_)
-    {
-        const double dt = std::abs(fix.header.stamp.toSec() - t);
-        if (dt < best_dt)
-        {
-            best_dt = dt;
-            lat = fix.latitude;
-            lon = fix.longitude;
-            alt = fix.altitude;
-            found = true;
-        }
-    }
-    return found;
 }
 
 GpsHandler::FactorResult GpsHandler::tryAddFactor(

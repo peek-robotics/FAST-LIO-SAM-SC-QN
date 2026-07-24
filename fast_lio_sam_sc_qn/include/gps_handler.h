@@ -225,11 +225,6 @@ private:
     /// Caller MUST hold gps_mutex_ (because this also acquires fix_mutex_).
     const GpsFixTier* resolveFixTier(double msg_time);
 
-    /// PHASE 2: nearest raw NavSatFix lat/lon/alt to time `t` (±0.15 s), used to
-    /// reproject GPS odom into the true-north local-ENU datum frame. Also prunes
-    /// stale fixes. Caller holds gps_mutex_; locks fix_mutex_ (order as resolveFixTier).
-    bool nearestFixLL(double t, double& lat, double& lon, double& alt);
-
     /// Build the GPS position-factor noise model: diagonal variances, optionally
     /// wrapped in a robust m-estimator per robust_kernel/robust_thresh (#2).
     gtsam::noiseModel::Base::shared_ptr makeGpsNoise(const gtsam::Vector3& var) const;
