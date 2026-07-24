@@ -316,6 +316,12 @@ void FastLioSamScQn::setupRos(double loop_hz, double vis_hz,
                                           &FastLioSamScQn::saveMapSrvCallback, this);
     ROS_INFO("[SLAM] Save-map service ready at %s/save_map", nh_.getNamespace().c_str());
 
+    // Latched signal: the save dir, published after every saveMapPcd (any trigger
+    // -- service, save-flag, GBA finish, shutdown). map_export subscribes and
+    // auto-georeferences it to LAZ. Latched so a late subscriber still sees the
+    // most recent save.
+    map_saved_pub_ = nh_.advertise<std_msgs::String>("map_saved", 1, /*latch=*/true);
+
     // /toLL client (robot_localization) — used at save time to convert the
     // map origin (0,0,0) to WGS-84 lat/lon/alt for metadata. Created here so
     // it persists; the service need not be up at startup.
@@ -1341,6 +1347,13 @@ std::string FastLioSamScQn::saveMapPcd(const std::string& base_dir)
     // 3) SC descriptors
     loop_closure_->saveDescriptors(out_dir.string());
 
+    // Signal listeners (map_export) that a map was saved, so they can
+    // auto-georeference it to LAZ using the Python georef tools.
+    {
+        std_msgs::String saved_msg;
+        saved_msg.data = out_dir.string();
+        map_saved_pub_.publish(saved_msg);
+    }
     return out_dir.string();
 }
 
