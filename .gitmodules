@@ -6,7 +6,7 @@
 	url = https://github.com/engcang/nano_gicp
 [submodule "third_party/scancontext_tro"]
 	path = third_party/scancontext_tro
-	url = https://github.com/engbi-kim/scancontext_tro
+	url = https://github.com/peek-robotics/scancontext_tro
 [submodule "third_party/TEASER-plusplus"]
 	path = third_party/TEASER-plusplus
 	url = https://github.com/MIT-SPARK/TEASER-plusplus
